@@ -9,6 +9,11 @@ sudo apt install libfuse3-dev
 ~~~
 
 to install the dependency.
+Afterwards, you can install `nfs_analyze` and `fuse_nfs`, for example with [pipx](https://github.com/pypa/pipx), using:
+
+~~~
+pipx install git+https://github.com/hvs-consulting/offensive-nfs.git
+~~~
 
 # nfs-analyze
 This script prints details about an NFS server and detects some potential misconfigurations which are highlighted in red.
