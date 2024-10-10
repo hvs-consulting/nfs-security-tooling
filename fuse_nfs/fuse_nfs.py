@@ -77,7 +77,7 @@ class DirEntry:
         self.items = items
 
 class FuseNFS(pyfuse3.Operations):
-    def __init__(self, host, export, mountpoint, id, fake_uid, fake_uid_allow_root, allow_write, manual_fh, remote_symlinks, unprivileged_port):
+    def __init__(self, host, export, mountpoint, id, fake_uid, fake_uid_allow_root, allow_write, manual_fh, remote_symlinks, unprivileged_port, fix_nested_exports):
         super(FuseNFS, self).__init__()
 
         self.host = host
@@ -89,6 +89,7 @@ class FuseNFS(pyfuse3.Operations):
         self.manual_fh = manual_fh
         self.remote_symlinks = remote_symlinks
         self.unprivileged_port = unprivileged_port
+        self.fix_nested_exports = fix_nested_exports
         self.uid, self.gid = [int(x) for x in id.split(":")]
         self.conn_factory = NFS3ConnectionFactory.from_url(f"nfs://{self.host}/?privport={0 if unprivileged_port else 1}")
         self.conn_factory.credential = AUTH_SYS(0, "b", self.uid, self.gid, [1001])
@@ -105,7 +106,7 @@ class FuseNFS(pyfuse3.Operations):
             raise RuntimeError("No export or file handle provided")
 
         sys.setrecursionlimit(100000)
-        print(f"recursion limit: {sys.getrecursionlimit()}")
+        log.debug(f"recursion limit: {sys.getrecursionlimit()}")
     
     async def init_mount(self):
         if self.root_fh == None:
@@ -114,21 +115,29 @@ class FuseNFS(pyfuse3.Operations):
     async def mount_export(self):
         if self.export != None:
             connect_result = await self.mount.connect()
-            print(f"Connect result: {connect_result}")
+            if connect_result[0] == False:
+                log.error(f"Error connecting to Portmap/Mountd: {connect_result[1]}")
+                exit(1)
             mount_result = await self.mount.mount(self.export)
             if mount_result[1] == None:
                 self.root_fh = mount_result[0]
             else:
-                print(f"Error mounting export: {str(mount_result[1])}")
-                exit()
-            print(self.root_fh)
+                log.error(f"Error mounting export: {str(mount_result[1])}")
+                exit(1)
+            log.info(f"root fh: {self.root_fh}")
         else:
             if self.manual_fh.startswith("0x"):
                 self.manual_fh = self.manual_fh[2:]
             self.root_fh = binascii.unhexlify(self.manual_fh)
         self.nfs = self.conn_factory.get_client(self.root_fh)
-        await self.nfs.connect()
-        await self.nfs.null()
+        connect_result = await self.nfs.connect()
+        if connect_result[0] == False:
+            log.error(f"Error connecting to NFS server: {str(connect_result[1])}")
+            exit(1)
+        null_result = await self.nfs.null()
+        if null_result[0] == False:
+            log.error(f"Error checking NFS connection: {str(null_result[1])}")
+            exit(1)
         self.connected = True
         await self.set_uid(self.uid, self.gid)
         asyncio.create_task(self.keepalive())
@@ -150,29 +159,29 @@ class FuseNFS(pyfuse3.Operations):
     
     async def getattr(self, inode, ctx=None):
         await self.init_mount()
-        print(f"getattr {inode}")
+        log.debug(f"getattr {inode}")
         result = await self.nfs.getattr(ino_to_fh(inode))
         await self.handle_error(result, "getattr")
         return await self.convert_attributes(result[0])
 
     async def lookup(self, parent_inode, name, ctx=None):
         await self.init_mount()
-        print(f"lookup {name}, ")
+        log.debug(f"lookup {name}, ")
         if self.root_fh == None:
-            print("lookup too early")
+            log.debug("lookup too early")
             raise pyfuse3.FUSEError(errno.ENOENT)
         lookup_res = await self.nfs.lookup(ino_to_fh(parent_inode), name.decode("utf-8"))
         if lookup_res[0] == False:
-            print("error lookup")
+            log.debug("error lookup")
             raise pyfuse3.FUSEError(errno.ENOENT)
-        print(lookup_res)
+        log.debug(lookup_res)
         return await self.convert_attributes(lookup_res[0])
 
     async def opendir(self, inode, ctx):
         async with self.dir_cache_lock:
             await self.init_mount()
             await self.auto_set_uid(inode)
-            print(f"opendir {inode}")
+            log.debug(f"opendir {inode}")
 
             dir_entry = DirEntry(0, [])
 
@@ -181,28 +190,28 @@ class FuseNFS(pyfuse3.Operations):
                     if entry.name != ".." and entry.name != ".":
                         dir_entry.items.append(entry)
                 else:
-                    print("readirplus error: ", end="")
-                    print(error)
+                    log.error("readirplus error: ")
+                    log.error(error)
             
-            print("opendir assign")
+            log.debug("opendir assign")
             self.dirs[inode] = dir_entry
-            print("opendir done")
+            log.debug("opendir done")
 
             await self.reset_uid()
             return inode
     
     async def releasedir(self, handle):
-        print(f"releasedir {handle}")
+        log.debug(f"releasedir {handle}")
         return
 
     async def readdir(self, ino, start_id, token):
-        print(token)
-        print(start_id)
+        log.debug(token)
+        log.debug(start_id)
 
         index = start_id
         for entry in self.dirs[ino].items[index:]:
             index += 1
-            if pyfuse3.readdir_reply(token, entry.name.encode("utf-8"), await self.convert_attributes(entry), index) == False:
+            if pyfuse3.readdir_reply(token, entry.name.encode("utf-8"), await self.convert_attributes(entry, True, ino), index) == False:
                 self.dirs[ino].index = index
                 return
     
@@ -238,7 +247,7 @@ class FuseNFS(pyfuse3.Operations):
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, ino, off, size):
-        print(f"read: {ino}")
+        log.debug(f"read: {ino}")
         await self.init_mount()
         await self.auto_set_uid(ino)
         result = await self.nfs.read(ino_to_fh(ino), off, size)
@@ -249,26 +258,17 @@ class FuseNFS(pyfuse3.Operations):
     
     async def write(self, ino, off, buf):
         self.only_writable()
-        print(f"write: {ino}")
+        log.debug(f"write: {ino}")
         await self.init_mount()
         await self.auto_set_uid(ino)
-
         result = await self.nfs.write(ino_to_fh(ino), off, len(buf), buf, FILE_SYNC)
-        if result[0] == False:
-            print(f"write error: {result[1]}")
-            await self.reset_uid()
-            raise pyfuse3.FUSEError(errno.EIO)
-
-        if result[0]["status"] != 0:
-            print(f"write nfs error: {result[0]['status']}")
-            await self.reset_uid()
-            raise pyfuse3.FUSEError(errno.EIO)
+        await self.handle_error(result, "write")
         
         await self.reset_uid()
         return result[0]["resok"]["count"]
 
     async def create(self, parent_inode, name, mode, flags, ctx):
-        print(f"create: {parent_inode}, {name}, {mode}")
+        log.debug(f"create: {parent_inode}, {name}, {mode}")
         self.only_writable()
         await self.init_mount()
         await self.auto_set_uid(parent_inode)
@@ -279,7 +279,7 @@ class FuseNFS(pyfuse3.Operations):
         return (file_info, convert_attributes(result[0]))
 
     async def unlink(self, parent_inode, name, ctx):
-        print(f"unlink: {parent_inode}, {name}")
+        log.debug(f"unlink: {parent_inode}, {name}")
         self.only_writable()
         await self.init_mount()
         await self.auto_set_uid(parent_inode)
@@ -288,7 +288,7 @@ class FuseNFS(pyfuse3.Operations):
         await self.handle_error(result, "unlink")
 
     async def setattr(self, inode, attr, fields, fh, ctx):
-        print(f"setattr: {inode}, {attr.st_mode}")
+        log.debug(f"setattr: {inode}, {attr.st_mode}")
         self.only_writable()
         await self.init_mount()
         await self.auto_set_uid(inode)
@@ -319,7 +319,7 @@ class FuseNFS(pyfuse3.Operations):
         return path.encode("utf-8")
 
     async def symlink(self, parent_inode, name, target, ctx):
-        print(f"symlink: {parent_inode}: {name} -> {target}")
+        log.debug(f"symlink: {parent_inode}: {name} -> {target}")
         self.only_writable()
         await self.init_mount()
         await self.auto_set_uid(parent_inode)
@@ -334,18 +334,29 @@ class FuseNFS(pyfuse3.Operations):
         self.only_writable()
         await self.init_mount()
         await self.auto_set_uid(parent_inode)
-        print(f"mknod {rdev}")
+        log.debug(f"mknod {rdev}")
         result = await self.nfs.mknod(ino_to_fh(parent_inode), name.decode("utf-8"), fuse_to_nfs_type(mode), mode & 0o777, spec_major = rdev >> 8, spec_minor = rdev & 0xFF)
-        print(result)
+        log.debug(result)
         await self.handle_error(result, "mknod")
         await self.reset_uid()
         #return await self.convert_attributes(result[0])
         return await self.lookup(parent_inode, name)
 
-    async def convert_attributes(self, entry: NFSFileEntry):
+    async def convert_attributes(self, entry: NFSFileEntry, fix_missing: bool = False, parent_inode: int = 0):
         attrs = pyfuse3.EntryAttributes()
 
         mode = entry.mode
+        
+        if self.fix_nested_exports and fix_missing and mode == None:
+            log.info("trying to fix missing attributes")
+            lookup_res = await self.nfs.lookup(ino_to_fh(parent_inode), entry.name.encode("utf-8"))
+            if lookup_res[0] == False:
+                log.error("error lookup")
+                log.error(lookup_res[1])
+            else:
+                log.debug(lookup_res)
+                entry = lookup_res[0]
+                mode = entry.mode
 
         if mode != None and self.fake_uid:
             if self.fake_uid_allow_root:
@@ -379,18 +390,22 @@ class FuseNFS(pyfuse3.Operations):
     
     async def handle_error(self, result, name):
         if result[0] == False:
-            print(f"{name} error: {result[1]}")
+            log.error(f"{name} error: {result[1]}")
             await self.reset_uid()
             raise pyfuse3.FUSEError(errno.EIO)
         
         if type(result[0]) == dict and "status" in result[0] and result[0]["status"] != 0:
-            print(f"{name} nfs error {result[0]['status']}")
+            error = result[0]['status']
+            log.error(f"{name} nfs error {error}")
             await self.reset_uid()
-            raise pyfuse3.FUSEError(errno.EIO)
+            if error < 10000:
+                raise pyfuse3.FUSEError(error)
+            else:
+                raise pyfuse3.FUSEError(errno.EIO)
 
     def only_writable(self):
         if not self.allow_write:
-            raise pyfuse3.FUSEError(errno.ENOTSUP)
+            raise pyfuse3.FUSEError(errno.EROFS)
     
     async def keepalive(self):
         while True:
@@ -446,6 +461,7 @@ def init_logging(debug=False):
     else:
         handler.setLevel(logging.INFO)
         root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
     root_logger.addHandler(handler)
 
 def parse_args():
@@ -476,6 +492,8 @@ def parse_args():
                         help='Follow symlinks on the server, not the client')
     parser.add_argument('--unprivileged-port', action='store_true', default=False,
                         help='Connect from a port >1024')
+    parser.add_argument('--fix-nested-exports', action='store_true', default=False,
+                        help='Make nested exports on NetApp servers work')
     parser.add_argument('--debug', action='store_true', default=False,
                         help='Enable debugging output')
     parser.add_argument('--debug-fuse', action='store_true', default=False,
@@ -487,7 +505,7 @@ def main():
     options = parse_args()
     init_logging(options.debug)
 
-    fuse_nfs = FuseNFS(options.host, options.export, options.mountpoint, options.uid, options.fake_uid, options.fake_uid_allow_root, options.allow_write, options.manual_fh, options.remote_symlinks, options.unprivileged_port)
+    fuse_nfs = FuseNFS(options.host, options.export, options.mountpoint, options.uid, options.fake_uid, options.fake_uid_allow_root, options.allow_write, options.manual_fh, options.remote_symlinks, options.unprivileged_port, options.fix_nested_exports)
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add('fsname=fuse_nfs')
     fuse_options.add('allow_other')
@@ -497,7 +515,11 @@ def main():
     fuse_options.add('suid')
     if options.debug_fuse:
         fuse_options.add('debug')
-    pyfuse3.init(fuse_nfs, options.mountpoint, fuse_options)
+    try:
+        pyfuse3.init(fuse_nfs, options.mountpoint, fuse_options)
+    except RuntimeError as e:
+        log.error(f"Error setting up fuse mount: {str(e)}")
+        log.error(f"Make sure that {options.mountpoint} has been unmounted")
     loop = asyncio.get_event_loop()
     try:
         loop.run_until_complete(pyfuse3.main())

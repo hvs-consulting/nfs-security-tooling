@@ -13,6 +13,7 @@ import importlib
 import json
 import copy
 import datetime
+import traceback
 
 import rpc.security
 
@@ -53,6 +54,14 @@ default_json_out = {
         "reason": "",
         "directories": {},
     }
+}
+
+default_findings = {
+    "mountable_exports": {},
+    "escapable_exports": {},
+    "etc_shadow_exports": {},
+    "no_root_squash_exports": {},
+    "no_signing_hosts": [],
 }
 
 auth_sys = rpc.security.AuthSys()
@@ -129,9 +138,11 @@ pmap_protocol_numbers = {
     100000: "portmap",
     100005: "mountd",
     100003: "nfs",
+    100011: "rquota",
     100021: "nfs lock manager",
     100024: "status monitor 2",
     100227: "nfs acl",
+    400010: "netapp partner",
     400122: "localio",
 }
 
@@ -220,6 +231,8 @@ def ping_host(host):
     if host in ping_host.cache:
         return ping_host.cache[host]
     else:
+        if "%" in host:
+            host = host.split("%")[0]
         result = False
         try:
             result = subprocess.run(["timeout", str(options.ping_timeout), "ping", "-c", "1", host], stdout=subprocess.DEVNULL).returncode == 0
@@ -277,6 +290,8 @@ def mount_print_details(exports: xdrdef.mnt3_type.exportnode, mount_results, jso
                     auth_methods.append(get_auth_method(auth_method)[1])
                 auth_methods_text = ", ".join(auth_methods)
                 file_handle_text = binascii.hexlify(result.fhandle).decode()
+            elif result.fhs_status == xdrdef.mnt3_const.MNT3ERR_ACCES:
+                auth_methods_text = "Access denied"
             else:
                 auth_methods_text = f"mount failed, response: {xdrdef.mnt3_const.mountstat3[result.fhs_status]}"
         else:
@@ -402,7 +417,8 @@ def nfs3_check_escape(nfs3_client: nfs3client.NFS3Client, root_fh: bytearray, ex
         nfs3_check_root_permissions(nfs3_client, root_fh, export, json_entry["symlink_escape"])
         return True
     else:
-        json_entry["status"] = JSONStatus.OK
+        if json_entry["status"] != JSONStatus.VULNERABLE:
+            json_entry["status"] = JSONStatus.OK
     return False
 
 def nfs3_try_escape(nfs3_client: nfs3client.NFS3Client, mount_results, json_out):
@@ -689,7 +705,7 @@ def nfs4_secinfo_to_json(secinfo: xdrdef.nfs4_type.secinfo4):
 def nfs4_dir_secinfo(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, json_entry, file_handle, depth, limit = 10, maxdepth=2):
     dir_result = nfs4_list_dir(nfs4_client, file_handle)
     if len(dir_result.resarray) < 2 or dir_result.resarray[1].opreaddir == None or dir_result.resarray[1].opreaddir.status != xdrdef.nfs4_const.NFS4_OK:
-        print(f"{' ' * depth * 4}Error reading directory")
+        print(f"{' ' * depth * 4}Error reading directory" + f" {dir_result.resarray[1].opreaddir.status}" if options.verbose_errors else "")
     else:
         entries = dir_result.resarray[1].opreaddir.resok4.entries
         for entry in entries:
@@ -715,6 +731,8 @@ def nfs4_show_overview(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRe
         json_out["nfs4_overview"]["status"] = JSONStatus.OK
     except Exception as e:
         print(f"Error listing directories: {e}")
+        if options.verbose_errors:
+            traceback.print_exc()
         json_out["nfs4_overview"]["status"] = JSONStatus.ERROR
         json_out["nfs4_overview"]["reason"] = str(e)
 
@@ -895,9 +913,13 @@ def init_client(inner_fn, **args):
         client = inner_fn(**args)
         return client
     except OSError as e:
-        pass
+        if options.verbose_errors:
+            print(f"OSError: {e}")
+            traceback.print_exc()
     except rpc.rpc.RPCError as e:
-        pass
+        if options.verbose_errors:
+            print(f"RPCError: {e}")
+            traceback.print_exc()
     except Exception as e:
         print(f"Unknown exception {e}")
     if client != None:
@@ -997,7 +1019,7 @@ def nfs_print_version_support(version_support: dict):
 def parse_args():
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
 
-    parser.add_argument("target", type=str, nargs="+",
+    parser.add_argument("target", type=str, nargs="*",
                         help="Target host, IP address or hostname")
     parser.add_argument("--check-no-root-squash", action="store_true",
                         help="Test if no_root_squash is enabled on the server which can be used for privilege escalation on clients. \n WARNING: THIS WRITES DATA ON THE SERVER")
@@ -1005,7 +1027,7 @@ def parse_args():
                         help="Number of subvolumes to try to read when escaping a BTRFS export")
     parser.add_argument("--delay", type=int, default=1000,
                         help="Number of milliseconds to wait between connections. If this value is too low, connections might fail")
-    parser.add_argument("--timeout", type=int, default=1000,
+    parser.add_argument("--timeout", type=int, default=3000,
                         help="Socket timeout in milliseconds")
     parser.add_argument("--skip-version-check", action="store_true",
                         help="Skip version check to speed up the test")
@@ -1017,10 +1039,167 @@ def parse_args():
                         help="Number of seconds before a ping times out")
     parser.add_argument("--charset", type=str, default="utf-8",
                         help="charset used by the server")
-    parser.add_argument("--json", type=str,
-                        help="Output to json file")
+    parser.add_argument("--hosts-file", type=str,
+                        help="Path to UTF-8 encoded file containing a host in each line")
+    parser.add_argument("--json-file", type=str,
+                        help="Output to a single json file")
+    parser.add_argument("--json-dir", type=str,
+                        help="Output to one json file per host in given directory")
+    parser.add_argument("--findings-file", type=str,
+                        help="Output a short summary of findings")
+    parser.add_argument("--verbose-errors", action="store_true",
+                        help="Verbose error logging")
+    parser.add_argument("--reload-pynfs", action="store_true",
+                        help="Reload pynfs after every host")
     
     return parser.parse_args()
+
+def add_entry_to_dict(dict, key, value):
+    if not key in dict:
+        dict[key] = []
+    dict[key].append(value)
+
+def summarize_findings(json_result, findings):
+    for hostname, host in json_result.items():
+        if host["exports"]["status"] == JSONStatus.OK and "directories" in host["exports"] and len(host["exports"]["directories"]) != 0:
+            for directory, export in host["exports"]["directories"].items():
+                if export["mount_result"] == "MNT3_OK" and "sys" in export["auth_methods"]:
+                    add_entry_to_dict(findings["mountable_exports"], hostname, directory)
+                    if export["escape"]["status"] == JSONStatus.VULNERABLE:
+                        add_entry_to_dict(findings["escapable_exports"], hostname, directory)
+                        if export["escape"]["etc_shadow"]["status"] == JSONStatus.VULNERABLE:
+                            add_entry_to_dict(findings["etc_shadow_exports"], hostname, directory)
+                    if export["no_root_squash"]["status"] == JSONStatus.VULNERABLE:
+                        add_entry_to_dict(findings["no_root_squash_exports"], hostname, directory)
+        if host["windows_handle_signing"]["status"] == JSONStatus.VULNERABLE:
+            findings["no_signing_hosts"].append(hostname)
+
+def parse_hosts_file():
+    try:
+        with open(options.hosts_file, "r") as file:
+            lines = file.readlines()
+            lines = [line.strip() for line in lines]
+            lines = [line for line in lines if len(line) != 0]
+            return lines
+    except Exception as e:
+        print(f"Error reading hosts file: {str(e)}")
+
+def write_json_file(hostname, json_data):
+    if options.json_dir != None:
+        with open(os.path.join(options.json_dir, f"{hostname}.json"), "w") as out_file:
+            json.dump(json_data, out_file, indent=4)
+
+def scan_host(hostname, json_out):
+    if options.reload_pynfs:
+        for name in list(sys.modules.keys()):
+            if name.startswith("rpc") or name.startswith("nfs4") or name.startswith("gssapi"):
+                importlib.reload(sys.modules[name])
+        #importlib.reload(sys.modules["rpc.rpc"])
+        #importlib.reload(sys.modules["nfs4.nfs3client"])
+        #importlib.reload(sys.modules["nfs4.nfs4client"])
+    exports = None
+    mount_results = None
+    print(f"Checking host {hostname}")
+
+    portmap_client = init_client(portmap_init_client, hostname=hostname)
+    if portmap_client != None:
+        try:
+            mappings = portmap_client.proc(xdrdef.portmap_const.PMAPPROC_DUMP, 0, "pmaplistptr")
+        except rpc.rpc.RPCDeniedError as e:
+            print("Error requesting portmap listing, probably NAS with strict security settings")
+            json_out["portmap"]["status"] = JSONStatus.ERROR
+            json_out["portmap"]["reason"] = "strict_security"
+
+            return json_out
+        pmap_print_summary(mappings, json_out)
+        mountd_port = pmap_get_mountd_port(mappings)
+        portmap_client.stop()
+        if mountd_port != -1:
+            mountd_client = init_client(mount_init_client, hostname=hostname, port=mountd_port)
+            if mountd_client != None:
+                print()
+                try:
+                    exports = mountd_client.proc(xdrdef.mnt3_const.MOUNTPROC3_EXPORT, 0, "exports")
+                    mount_results = mount_get_all_info(mountd_client, exports)
+                    mount_print_details(exports, mount_results, json_out)
+                    print()
+                    mount_print_clients(mount_get_all_clients(mountd_client), json_out)
+                    mountd_client.stop()
+                except rpc.rpc.RPCDeniedError as e:
+                    print("Error requesting exports, probably NAS with strict security settings")
+                    json_out["exports"]["status"] = JSONStatus.ERROR
+                    json_out["exports"]["reason"] = "strict_security"
+
+                    return json_out
+            else:
+                print("Error connecting to Mountd")
+        else:
+            print("Server does not support Mountd, skipping NFSv3 checks")
+    else:
+        print("Server does not support Portmap, skipping NFSv3 checks")
+
+    print()
+
+    #Default value if version check is skipped to ensure windows compatiblity
+    nfs_supported_versions = {
+        "3": True,
+        "4.0": False,
+        "4.1": True,
+        "4.2": False,
+    }
+
+    if not options.skip_version_check:
+        nfs_supported_versions = nfs_check_version_support(hostname, 2049, json_out)
+        if True in nfs_supported_versions.values():
+            nfs_print_version_support(nfs_supported_versions)
+        else:
+            print(Coloring.error("No NFS server detected"))
+
+            return json_out
+
+    print()
+
+    if nfs_supported_versions["3"] and exports != None and mount_results != None:
+        nfs3_check_windows_signing(mount_results, json_out)
+        print()
+
+        nfs3_client = init_client(nfs3_init_client, hostname=hostname, port=2049)
+        if nfs3_client == None:
+            print(Coloring.error("Error connecting to NFSv3 server"))
+        else:
+            auth_sys = rpc.security.AuthSys()
+            credential = auth_sys.init_cred(1000, 1000, b"test", 42, [1001, 1002])
+            nfs3_client.set_cred(credential)
+            nfs3_try_escape(nfs3_client, mount_results, json_out)
+
+            if options.check_no_root_squash:
+                nfs3_check_no_root_squash(nfs3_client, mount_results, json_out)
+                print()
+
+            nfs3_client.stop()
+
+    time.sleep(options.delay)
+
+    if nfs_supported_versions["4.0"] or nfs_supported_versions["4.1"] or nfs_supported_versions["4.2"]:
+        minorversion = 0 if nfs_supported_versions["4.0"] else 1 if nfs_supported_versions["4.1"] else 2
+        nfs4_client = init_client(nfs4_init_client, hostname=hostname, port=2049, minorversion=minorversion)
+        if nfs4_client == None:
+            print(Coloring.error("Error connecting to NFSv4 server"))
+        else:
+            auth_sys = rpc.security.AuthSys()
+            credential = auth_sys.init_cred(1000, 1000, b"test", 42, [1001, 1002])
+            nfs4_client.set_cred(credential)
+
+            if minorversion != 0:
+                nfs4_client = nfs41_init_session(nfs4_client)
+
+            if nfs4_client == None:
+                print(Coloring.error("Error creating NFSv4.1/4.2 session"))
+            else:
+                nfs4_show_overview(nfs4_client, json_out)
+                nfs_stop_client(nfs4_client)
+
+    return json_out
 
 def main():
     global options
@@ -1033,115 +1212,59 @@ def main():
     options.delay = options.delay / 1000.0
     options.timeout = options.timeout / 1000.0
 
-    exports = None
-    mount_results = None
+    if options.json_dir != None:
+        if os.path.exists(options.json_dir):
+            if not os.path.isdir(options.json_dir):
+                print("Error: json-dir parameter is not a directory")
+                return
+            if len(os.listdir(options.json_dir)) != 0:
+                print("Error: output directory not empty")
+                return
+        if not os.path.exists(options.json_dir):
+            try:
+                os.mkdir(options.json_dir)
+            except Exception as e:
+                print(f"Error creating output directory: {str(e)}")
+                return
 
-    for hostname in options.target:
-        print(f"Checking host {hostname}")
+    if len(options.target) != 0 and options.hosts_file != None:
+        print("Error: Both --hosts-file and target parameter given")
+        return
+
+    if len(options.target) == 0 and options.hosts_file == None:
+        print("Error: no hosts specified")
+        return
+    
+    hosts = []
+    if options.hosts_file != None:
+        hosts = parse_hosts_file()
+    else:
+        hosts = options.target
+
+    for hostname in hosts:
         json_out = copy.deepcopy(default_json_out)
         json_out["date"] = str(datetime.datetime.now())
+        try:
+            scan_host(hostname, json_out)
+        except Exception as e:
+            print(Coloring.error(f"Error scanning host {hostname}: {str(e)}"))
+            traceback.print_exc()
+            if options.json_dir != None:
+                with open(os.path.join(options.json_dir, f"{hostname}.error"), "w") as f:
+                    traceback.print_exc(None, f)
 
-        portmap_client = init_client(portmap_init_client, hostname=hostname)
-        if portmap_client != None:
-            try:
-                mappings = portmap_client.proc(xdrdef.portmap_const.PMAPPROC_DUMP, 0, "pmaplistptr")
-            except rpc.rpc.RPCDeniedError as e:
-                print("Error requesting portmap listing, probably Synology NAS with strict security settings")
-                json_out["portmap"]["status"] = JSONStatus.ERROR
-                json_out["portmap"]["reason"] = "synology_strict_settings"
-
-                json_result[hostname] = json_out
-                continue
-            pmap_print_summary(mappings, json_out)
-            mountd_port = pmap_get_mountd_port(mappings)
-            portmap_client.stop()
-            if mountd_port != -1:
-                mountd_client = init_client(mount_init_client, hostname=hostname, port=mountd_port)
-                if mountd_client != None:
-                    print()
-                    exports = mountd_client.proc(xdrdef.mnt3_const.MOUNTPROC3_EXPORT, 0, "exports")
-                    mount_results = mount_get_all_info(mountd_client, exports)
-                    mount_print_details(exports, mount_results, json_out)
-
-                    print()
-                    mount_print_clients(mount_get_all_clients(mountd_client), json_out)
-                    mountd_client.stop()
-                else:
-                    print("Error connecting to Mountd")
-            else:
-                print("Server does not support Mountd, skipping NFSv3 checks")
-        else:
-            print("Server does not support Portmap, skipping NFSv3 checks")
-
-        print()
-
-        #Default value if version check is skipped to ensure windows compatiblity
-        nfs_supported_versions = {
-            "3": True,
-            "4.0": False,
-            "4.1": True,
-            "4.2": False,
-        }
-
-        if not options.skip_version_check:
-            nfs_supported_versions = nfs_check_version_support(hostname, 2049, json_out)
-            if True in nfs_supported_versions.values():
-                nfs_print_version_support(nfs_supported_versions)
-            else:
-                print(Coloring.error("No NFS server detected"))
-
-                json_result[hostname] = json_out
-                continue
-
-        print()
-
-        if nfs_supported_versions["3"] and exports != None and mount_results != None:
-            nfs3_check_windows_signing(mount_results, json_out)
-            print()
-
-            nfs3_client = init_client(nfs3_init_client, hostname=hostname, port=2049)
-            if nfs3_client == None:
-                print(Coloring.error("Error connecting to NFSv3 server"))
-            else:
-                auth_sys = rpc.security.AuthSys()
-                credential = auth_sys.init_cred(1000, 1000, b"test", 42, [1001, 1002])
-                nfs3_client.set_cred(credential)
-                nfs3_try_escape(nfs3_client, mount_results, json_out)
-
-                if options.check_no_root_squash:
-                    nfs3_check_no_root_squash(nfs3_client, mount_results, json_out)
-                    print()
-
-                nfs3_client.stop()
-
-        time.sleep(options.delay)
-
-        if nfs_supported_versions["4.0"] or nfs_supported_versions["4.1"] or nfs_supported_versions["4.2"]:
-            minorversion = 0 if nfs_supported_versions["4.0"] else 1 if nfs_supported_versions["4.1"] else 2
-            nfs4_client = init_client(nfs4_init_client, hostname=hostname, port=2049, minorversion=minorversion)
-            if nfs4_client == None:
-                print(Coloring.error("Error connecting to NFSv4 server"))
-            else:
-                auth_sys = rpc.security.AuthSys()
-                credential = auth_sys.init_cred(1000, 1000, b"test", 42, [1001, 1002])
-                nfs4_client.set_cred(credential)
-
-                if minorversion != 0:
-                    nfs4_client = nfs41_init_session(nfs4_client)
-
-                if nfs4_client == None:
-                    print(Coloring.error("Error creating NFSv4.1/4.2 session"))
-                else:
-                    nfs4_show_overview(nfs4_client, json_out)
-                    nfs_stop_client(nfs4_client)
-
-        if options.json != None:
-            json_result[hostname] = json_out
+        json_result[hostname] = json_out
+        write_json_file(hostname, json_out)
         
-    if options.json != None:
-        with open(options.json, "w") as f:
+    if options.json_file != None:
+        with open(options.json_file, "w") as f:
             json.dump(json_result, f, indent=4)
 
+    if options.findings_file != None:
+        findings = copy.deepcopy(default_findings)
+        summarize_findings(json_result, findings)
+        with open(options.findings_file, "w") as f:
+            json.dump(findings, f, indent=4)
 
 if __name__ == "__main__":
     main()
