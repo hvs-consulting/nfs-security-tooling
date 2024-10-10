@@ -3,7 +3,7 @@ requires = ["setuptools", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nfs_enum"
+name = "nfs_security_tooling"
 version = "0.1"
 dependencies = [
     'rpc @ git+ssh://git@github.com/hvs-consulting/pynfs.git#egg=rpc&subdirectory=rpc',
