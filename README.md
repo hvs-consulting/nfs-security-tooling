@@ -12,7 +12,7 @@ to install the dependency.
 Afterwards, you can install `nfs_analyze` and `fuse_nfs`, for example with [pipx](https://github.com/pypa/pipx), using:
 
 ~~~
-pipx install git+https://github.com/hvs-consulting/offensive-nfs.git
+pipx install git+https://github.com/hvs-consulting/nfs-security-tooling.git
 ~~~
 
 # nfs_analyze
