@@ -1046,7 +1046,7 @@ def parse_args():
     parser.add_argument("--json-dir", type=str,
                         help="Output to one json file per host in given directory")
     parser.add_argument("--findings-file", type=str,
-                        help="Output a short summary of findings")
+                        help="Output a short summary of findings to a json file")
     parser.add_argument("--verbose-errors", action="store_true",
                         help="Verbose error logging")
     parser.add_argument("--reload-pynfs", action="store_true",
