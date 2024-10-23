@@ -22,10 +22,11 @@ It is based on a [modified version of pynfs](https://github.com/hvs-consulting/p
 **WARNING**: *This script leaves traces in logs and the rmtab on the server.*
 
 ```
-usage: nfs_analyze [-h] [--check-no-root-squash] [--btrfs-subvolumes BTRFS_SUBVOLUMES] [--delay DELAY] [--timeout TIMEOUT] [--skip-version-check] [--no-color] [--no-ping] [--ping-timeout PING_TIMEOUT] [--charset CHARSET] [--hosts-file HOSTS_FILE] [--json-file JSON_FILE] [--json-dir JSON_DIR] [--findings-file FINDINGS_FILE] [--verbose-errors] [--reload-pynfs] [target ...]
+usage: nfs_analyze [-h] [--check-no-root-squash] [--btrfs-subvolumes BTRFS_SUBVOLUMES] [--delay DELAY] [--timeout TIMEOUT] [--skip-version-check] [--no-color] [--no-ping] [--ping-timeout PING_TIMEOUT] [--charset CHARSET] [--json-file JSON_FILE] [--json-dir JSON_DIR] [--findings-file FINDINGS_FILE] [--verbose-errors] [--reload-pynfs]
+                   [target ...]
 
 positional arguments:
-  target                Target host, IP address or hostname (default: None)
+  target                List of targets, each target can be an IP address, a hostname or a path to a file containing a host on each line (default: None)
 
 options:
   -h, --help            show this help message and exit
@@ -41,20 +42,17 @@ options:
   --ping-timeout PING_TIMEOUT
                         Number of seconds before a ping times out (default: 1)
   --charset CHARSET     charset used by the server (default: utf-8)
-  --hosts-file HOSTS_FILE
-                        Path to UTF-8 encoded file containing a host in each line (default: None)
   --json-file JSON_FILE
                         Output to a single json file (default: None)
   --json-dir JSON_DIR   Output to one json file per host in given directory (default: None)
   --findings-file FINDINGS_FILE
-                        Output a short summary of findings (default: None)
+                        Output a short summary of findings to a json file (default: None)
   --verbose-errors      Verbose error logging (default: False)
   --reload-pynfs        Reload pynfs after every host (default: False)
-
 ```
 
 ## Input and Output format
-A list of hosts can either be provided on the command line or as a file using the `--hosts-file` parameter.
+A list of targets has to be provided. Each target can be an IP address, a hostname or a path to a file containing a host on each line.
 
 Colored human-readable output is printed to the terminal, the colors can be disabled using the `--no-color` option.
 There are three parameters to generate machine-readable output.
@@ -132,6 +130,7 @@ This check is useful if the server doesn't support NFSv3 and the first check doe
 
 # fuse_nfs
 This is a fuse driver that can mount an NFS export. The advantage of this script compared to the normal mount command is that it autamatically sends the right uid and gid to the server to get access to as many files as possible. It is also able to mount an arbitrary file handle including file system root file handles found by nfs_analyze.
+This tool is based on [anfs](https://github.com/skelsec/anfs).
 
 ## Required setup
 Edit `/etc/fuse.conf` and uncomment the line `user_allow_other`
@@ -169,7 +168,7 @@ To stop the program, run ```umount mountpoint```. Also run this command when the
 By default only read operations are allowed. If you need to make changes to the server, use `--allow-write`.
 
 Use one of the options `--uid` or `--fake-uid`. If you want to browse a share, `--fake-uid` is the right option. If no_root_squash is enabled, also enable the `--fake-uid-allow-root` option to get access to files owned by root. If you want to upload a file with a specific UID and GID for privilege escalation, you can manually specify them using the `--uid` option.
-On the client side, the operating system's permission checks are bypassed by setting the permission bits of the other group to the permission bits of the owner and the group of the file while still showing the correct uid and gid of the file.
+On the client side, the operating system's permission checks are bypassed by setting the permission bits for others to the permission bits of the owner and the group of the file while still showing the correct uid and gid of the file.
 It does not matter which user account you use to access files on your machine.
 
 The inode numbers in the file system are not related to the actual inode numbers on the server. They are assigned by the anfs library based on when the file handle has been seen for the first time.

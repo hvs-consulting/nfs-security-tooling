@@ -207,13 +207,20 @@ def mount_get_all_info(mount_client: nfs3client.Mnt3Client, exports: xdrdef.mnt3
         response = mount_client.proc(xdrdef.mnt3_const.MOUNTPROC3_MNT, export.directory, "mountres3")
         result[export.directory] = response
     
-    mount_client.proc(xdrdef.mnt3_const.MOUNTPROC3_UMNTALL, 0, "void")
+    try:
+        mount_client.proc(xdrdef.mnt3_const.MOUNTPROC3_UMNTALL, 0, "void")
+    except Exception as e:
+        print(f"Error unmounting exports, IP might remain in rmtab on the server: {e}")
 
     return result
 
 def mount_get_all_clients(mount_client: nfs3client.Mnt3Client):
-    response = mount_client.proc(xdrdef.mnt3_const.MOUNTPROC3_DUMP, 0, "mountlist")
-    return response
+    try:
+        response = mount_client.proc(xdrdef.mnt3_const.MOUNTPROC3_DUMP, 0, "mountlist")
+        return response
+    except Exception as e:
+        print(f"Error getting list of clients: {e}")
+        return []
 
 def get_auth_method(number):
     auth_method_numbers = {
@@ -1020,7 +1027,7 @@ def parse_args():
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
 
     parser.add_argument("target", type=str, nargs="*",
-                        help="Target host, IP address or hostname")
+                        help="List of targets, each target can be an IP address, a hostname or a path to a file containing a host on each line")
     parser.add_argument("--check-no-root-squash", action="store_true",
                         help="Test if no_root_squash is enabled on the server which can be used for privilege escalation on clients. \n WARNING: THIS WRITES DATA ON THE SERVER")
     parser.add_argument("--btrfs-subvolumes", type=int, default=16,
@@ -1039,8 +1046,6 @@ def parse_args():
                         help="Number of seconds before a ping times out")
     parser.add_argument("--charset", type=str, default="utf-8",
                         help="charset used by the server")
-    parser.add_argument("--hosts-file", type=str,
-                        help="Path to UTF-8 encoded file containing a host in each line")
     parser.add_argument("--json-file", type=str,
                         help="Output to a single json file")
     parser.add_argument("--json-dir", type=str,
@@ -1074,15 +1079,16 @@ def summarize_findings(json_result, findings):
         if host["windows_handle_signing"]["status"] == JSONStatus.VULNERABLE:
             findings["no_signing_hosts"].append(hostname)
 
-def parse_hosts_file():
+def parse_hosts_file(file_name):
     try:
-        with open(options.hosts_file, "r") as file:
+        with open(file_name, "r") as file:
             lines = file.readlines()
             lines = [line.strip() for line in lines]
             lines = [line for line in lines if len(line) != 0]
             return lines
     except Exception as e:
         print(f"Error reading hosts file: {str(e)}")
+        return []
 
 def write_json_file(hostname, json_data):
     if options.json_dir != None:
@@ -1227,19 +1233,17 @@ def main():
                 print(f"Error creating output directory: {str(e)}")
                 return
 
-    if len(options.target) != 0 and options.hosts_file != None:
-        print("Error: Both --hosts-file and target parameter given")
-        return
-
-    if len(options.target) == 0 and options.hosts_file == None:
-        print("Error: no hosts specified")
+    if len(options.target) == 0:
+        print("Error: no targets specified")
         return
     
     hosts = []
-    if options.hosts_file != None:
-        hosts = parse_hosts_file()
-    else:
-        hosts = options.target
+
+    for target in options.target:
+        if os.path.isfile(target):
+            hosts += parse_hosts_file(target)
+        else:
+            hosts.append(target)
 
     for hostname in hosts:
         json_out = copy.deepcopy(default_json_out)
