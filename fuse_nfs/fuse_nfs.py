@@ -77,7 +77,7 @@ class DirEntry:
         self.items = items
 
 class FuseNFS(pyfuse3.Operations):
-    def __init__(self, host, export, mountpoint, id, fake_uid, fake_uid_allow_root, allow_write, manual_fh, remote_symlinks, unprivileged_port, fix_nested_exports):
+    def __init__(self, host, export, mountpoint, id, fake_uid, fake_uid_allow_root, allow_write, manual_fh, remote_symlinks, unprivileged_port, mount_port, nfs_port, fix_nested_exports):
         super(FuseNFS, self).__init__()
 
         self.host = host
@@ -89,11 +89,15 @@ class FuseNFS(pyfuse3.Operations):
         self.manual_fh = manual_fh
         self.remote_symlinks = remote_symlinks
         self.unprivileged_port = unprivileged_port
+        self.mount_port = mount_port
+        self.nfs_port = nfs_port
         self.fix_nested_exports = fix_nested_exports
         self.uid, self.gid = [int(x) for x in id.split(":")]
-        self.conn_factory = NFS3ConnectionFactory.from_url(f"nfs://{self.host}/?privport={0 if unprivileged_port else 1}")
+        self.conn_factory = NFS3ConnectionFactory.from_url(f"nfs://{self.host}{':'+str(nfs_port) if nfs_port != None else ''}/?privport={0 if unprivileged_port else 1}")
         self.conn_factory.credential = AUTH_SYS(0, "b", self.uid, self.gid, [1001])
-        self.mount = self.conn_factory.get_mount()
+        self.mount_conn_factory = NFS3ConnectionFactory.from_url(f"nfs://{self.host}{':'+str(mount_port) if mount_port != None else ''}/?privport={0 if unprivileged_port else 1}")
+        self.mount_conn_factory.credential = AUTH_SYS(0, "b", self.uid, self.gid, [1001])
+        self.mount = self.mount_conn_factory.get_mount()
         self.root_fh = None
         self.nfs = None
 
@@ -105,6 +109,7 @@ class FuseNFS(pyfuse3.Operations):
         if self.export == None and self.manual_fh == None:
             raise RuntimeError("No export or file handle provided")
 
+        #Necessary because the standard library function to deserialize arrays is recursive
         sys.setrecursionlimit(100000)
         log.debug(f"recursion limit: {sys.getrecursionlimit()}")
     
@@ -418,12 +423,6 @@ def ino_to_fh(ino):
 def fh_to_ino(fh):
     return fh + 1
 
-
-class X:
-    def __init__(self):
-        self.a = None
-        self.b = None
-
 file_types = [0, stat.S_IFREG, stat.S_IFDIR, stat.S_IFBLK, stat.S_IFCHR, stat.S_IFLNK, stat.S_IFSOCK, stat.S_IFIFO]
 
 def fuse_to_nfs_type(fuse_type):
@@ -492,6 +491,10 @@ def parse_args():
                         help='Follow symlinks on the server, not the client')
     parser.add_argument('--unprivileged-port', action='store_true', default=False,
                         help='Connect from a port >1024')
+    parser.add_argument('--mount-port', type=int, default=None,
+                        help='Use manual mount port instead of using portmap')
+    parser.add_argument('--nfs-port', type=int, default=None,
+                        help='Use manual NFS port instead of using portmap')
     parser.add_argument('--fix-nested-exports', action='store_true', default=False,
                         help='Make nested exports on NetApp servers work')
     parser.add_argument('--debug', action='store_true', default=False,
@@ -505,7 +508,7 @@ def main():
     options = parse_args()
     init_logging(options.debug)
 
-    fuse_nfs = FuseNFS(options.host, options.export, options.mountpoint, options.uid, options.fake_uid, options.fake_uid_allow_root, options.allow_write, options.manual_fh, options.remote_symlinks, options.unprivileged_port, options.fix_nested_exports)
+    fuse_nfs = FuseNFS(options.host, options.export, options.mountpoint, options.uid, options.fake_uid, options.fake_uid_allow_root, options.allow_write, options.manual_fh, options.remote_symlinks, options.unprivileged_port, options.mount_port, options.nfs_port, options.fix_nested_exports)
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add('fsname=fuse_nfs')
     fuse_options.add('allow_other')
@@ -519,7 +522,7 @@ def main():
         pyfuse3.init(fuse_nfs, options.mountpoint, fuse_options)
     except RuntimeError as e:
         log.error(f"Error setting up fuse mount: {str(e)}")
-        log.error(f"Make sure that {options.mountpoint} has been unmounted")
+        log.error(f"Make sure that {options.mountpoint} exists and has been unmounted")
     loop = asyncio.get_event_loop()
     try:
         loop.run_until_complete(pyfuse3.main())
