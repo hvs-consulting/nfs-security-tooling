@@ -1210,6 +1210,9 @@ def scan_host(hostname, json_out):
 def main():
     global options
 
+    #Necessary because the standard library function to deserialize arrays is recursive
+    sys.setrecursionlimit(100000)
+
     json_result = dict()
 
     logging.getLogger().setLevel("WARNING")
