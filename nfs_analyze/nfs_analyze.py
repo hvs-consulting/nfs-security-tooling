@@ -36,6 +36,7 @@ default_json_out = {
     "portmap": {
         "status": JSONStatus.UNKNOWN,
         "reason": "",
+        "resetting": None
     },
     "exports": {
         "status": JSONStatus.UNKNOWN,
@@ -53,6 +54,10 @@ default_json_out = {
         "status": JSONStatus.UNKNOWN,
         "reason": "",
         "directories": {},
+    },
+    "os": {
+        "final_guess": JSONStatus.UNKNOWN,
+        "checks": {},
     }
 }
 
@@ -141,9 +146,11 @@ pmap_protocol_numbers = {
     100011: "rquota",
     100021: "nfs lock manager",
     100024: "status monitor 2",
+    100133: "nsm_addr",
     100227: "nfs acl",
     400010: "netapp partner",
     400122: "localio",
+    1073741824: "nfs4cbd (HP-UX)"
 }
 
 def pmap_num_to_str(prog):
@@ -259,10 +266,14 @@ def get_host_info(host):
         return ({"type": "wildcard", "status": JSONStatus.UNKNOWN}, Coloring.warn("(wildcard)"))
     
     if "/" in host:
-        return ({"type": "wildcard", "status": JSONStatus.UNKNOWN}, Coloring.warn("(subnet)"))
+        return ({"type": "subnet", "status": JSONStatus.UNKNOWN}, Coloring.warn("(subnet)"))
     
     if "@" in host:
         return ({"type": "netgroup", "status": JSONStatus.UNKNOWN}, "(netgroup)")
+    
+    if (not "/" in host) and host.endswith(".0"):
+        return ({"type": "subnet_freebsd", "status": JSONStatus.UNKNOWN}, Coloring.error("(subnet FreeBSD)"))
+
     
     if not options.no_ping:
         is_up = ping_host(host)
@@ -536,7 +547,7 @@ def nfs3_read_etc_shadow(nfs3_client: nfs3client.NFS3Client, root_fh: bytearray,
             if read_res.status != xdrdef.nfs3_const.NFS3_OK:
                 if read_res.resfail != None and read_res.resfail.file_attributes != None and read_res.resfail.file_attributes.attributes_follow and read_res.resfail.file_attributes.attributes != None:
                     gid = read_res.resfail.file_attributes.attributes.gid
-                    old_credential = nfs3_client.default_cred
+                    old_credential = auth_sys.init_cred(1000, 1000, b"test", 42, [1001, 1002])
 
                     no_root_squash_enabled = False
                     if True:
@@ -580,7 +591,7 @@ def nfs3_check_no_root_squash(nfs3_client: nfs3client.NFS3Client, mount_results,
     print("Checking no_root_squash")
     data = [("Export", "no_root_squash")]
     test_file = b"nfs_analyze_test"
-    old_credential = nfs3_client.default_cred
+    old_credential = auth_sys.init_cred(1000, 1000, b"test", 42, [1001, 1002])
     root_credential = auth_sys.init_cred(0, 0, b"test", 43, [1001])
     nfs3_client.set_cred(root_credential)
     for directory in mount_results:
@@ -717,6 +728,10 @@ def nfs4_dir_secinfo(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionReco
         entries = dir_result.resarray[1].opreaddir.resok4.entries
         for entry in entries:
             if entry.attrs[xdrdef.nfs4_const.FATTR4_TYPE] == xdrdef.nfs4_const.NF4DIR:
+                if options.v4_show_exports_only and xdrdef.nfs4_const.FATTR4_FILEHANDLE in entry.attrs:
+                    fh = entry.attrs[xdrdef.nfs4_const.FATTR4_FILEHANDLE]
+                    if len(fh) > 4 and fh[0:2] == b"\x01\x00" and fh[3] != 0:
+                        continue
                 entry_name = entry.name.decode(options.charset)
                 print(f"{' ' * depth * 4}{entry_name}: ", end="")
                 json_entry |= {entry_name : {"security": None, "children": {}}}
@@ -731,10 +746,10 @@ def nfs4_dir_secinfo(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionReco
             pass
 
 def nfs4_show_overview(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, json_out):
-    print("NFSv4 overview and auth methods")
+    print("NFSv4 overview and auth methods (incomplete)")
     try:
         root_fh = nfs4_get_root_fh(nfs4_client)
-        nfs4_dir_secinfo(nfs4_client, json_out["nfs4_overview"]["directories"], root_fh.resarray[1].opgetfh.resok4.object, 0, 10, 2)
+        nfs4_dir_secinfo(nfs4_client, json_out["nfs4_overview"]["directories"], root_fh.resarray[1].opgetfh.resok4.object, 0, 10, options.v4_overview_depth)
         json_out["nfs4_overview"]["status"] = JSONStatus.OK
     except Exception as e:
         print(f"Error listing directories: {e}")
@@ -913,6 +928,41 @@ def nfs41_init_session(nfs4_client: nfs4client.NFS4Client):
         print(e)
     return None
 
+class ResettingClient:
+    def __init__(self, create_proc):
+        self.create_proc = create_proc
+        self.cred = None
+        pass
+
+    def proc(self, procnum, procarg, restypename = None):
+        client = self.create_proc()
+        if self.cred != None:
+            client.set_cred(self.cred)
+        res = None
+        if restypename == None:
+            res = client.proc(procnum, procarg)
+        else:
+            res = client.proc(procnum, procarg, restypename)
+        client.stop()
+        return res
+
+    def stop(self):
+        pass
+    
+    def set_cred(self, cred):
+        self.cred = cred
+
+def make_resetting_client(create_proc, test_proc):
+    client = create_proc()
+    test_proc(client)
+    try:
+        test_proc(client)
+        #raise rpc.rpc.RPCTimeout()
+        return client
+    except rpc.rpc.RPCTimeout:
+        print("Server only reacts to one request per TCP connection. Probably HP-UX. Resetting connection after each request")
+        return ResettingClient(create_proc)
+
 
 def init_client(inner_fn, **args):
     client = None
@@ -935,19 +985,16 @@ def init_client(inner_fn, **args):
     return None
 
 def portmap_init_client(hostname):
-    portmap_client = nfs3client.PORTMAPClient(host=hostname, timeout=options.timeout)
-    portmap_client.proc(xdrdef.portmap_const.PMAPPROC_NULL, 0, "void")
-    return portmap_client
+    return make_resetting_client(lambda : nfs3client.PORTMAPClient(host=hostname, timeout=options.timeout),
+                                 lambda c : c.proc(xdrdef.portmap_const.PMAPPROC_NULL, 0, "void"))
 
 def mount_init_client(hostname, port):
-    mountd_client = nfs3client.Mnt3Client(host=hostname, port=port, timeout=options.timeout)
-    mountd_client.proc(xdrdef.mnt3_const.MOUNTPROC3_NULL, 0, "void")
-    return mountd_client
+    return make_resetting_client(lambda : nfs3client.Mnt3Client(host=hostname, port=port, timeout=options.timeout),
+                                 lambda c : c.proc(xdrdef.mnt3_const.MOUNTPROC3_NULL, 0, "void"))
 
 def nfs3_init_client(hostname, port):
-    nfs3_client = nfs3client.NFS3Client(host=hostname, port=port, secure=True, timeout=options.timeout)
-    nfs3_client.null()
-    return nfs3_client
+    return make_resetting_client(lambda : nfs3client.NFS3Client(host=hostname, port=port, secure=True, timeout=options.timeout),
+                                 lambda c : c.null())
 
 def nfs4_init_client(hostname, port, minorversion):
     nfs4_client = nfs4client.NFS4Client(host=hostname, port=port, secure=True, minorversion=minorversion, timeout=options.timeout)
@@ -1023,6 +1070,104 @@ def nfs_print_version_support(version_support: dict):
     data = [("Version", "Supported")] + [(version, "Yes" if supported else "No") for version, supported in version_support.items()]
     print_table(data)
 
+def guess_os(json_out):
+    netapp_service = None
+    if "services" in json_out["portmap"]:
+        netapp_service = "netapp partner" in json_out["portmap"]["services"]
+    
+    linux_fh_0100 = None
+    windows_fh_32 = None
+    freebsd_subnet = None
+    if json_out["exports"]["status"] == JSONStatus.OK and "directories" in json_out["exports"] and len(json_out["exports"]["directories"]) != 0:
+        linux_fh_0100 = True
+        windows_fh_32 = True
+        valid_export = False
+        has_normal_subnet = False
+        has_freebsd_subnet = False
+        for export in json_out["exports"]["directories"].values():
+            if "file_handle" in export and export["file_handle"] != None and len(export["file_handle"]) != 0:
+                fh = export["file_handle"]
+                valid_export = True
+
+                linux_fh_0100 &= (fh[0:4] == "0100")
+                windows_fh_32 &= (len(fh) == 64)
+
+            if "allowed_clients" in export and export["allowed_clients"] != None and len(export["allowed_clients"]) != 0:
+                valid_export = True
+                for client in export["allowed_clients"]:
+                    has_normal_subnet |= (client["type"] == "subnet")
+                    has_freebsd_subnet |= (client["type"] == "subnet_freebsd")
+        
+        if has_normal_subnet and not has_freebsd_subnet:
+            freebsd_subnet = False
+        elif has_freebsd_subnet and not has_normal_subnet:
+            freebsd_subnet = True
+        
+        if not valid_export:
+            linux_fh_0100 = None
+            windows_fh_32 = None
+            freebsd_subnet = None
+    
+    hpux_resetting = json_out["portmap"]["resetting"]
+
+    windows_versions = None
+    if json_out["versions"]["status"] == JSONStatus.OK:
+        supported_versions = json_out["versions"]["supported"]
+        if not (True in supported_versions.values()):
+            windows_versions = None
+        else:
+            windows_versions = (supported_versions == {
+                "3": True,
+                "4.0": False,
+                "4.1": True,
+                "4.2": False
+            })
+
+    texts = {
+        None: Coloring.warn("Unknown"),
+        True: Coloring.ok("Yes"),
+        False: Coloring.error("No"),
+    }
+        
+    print("Trying to guess server OS")
+    output = [("OS", "Property", "Fulfilled"),
+        ("Linux", "File Handles start with 0x0100", texts[linux_fh_0100]),
+        ("Windows", "NFSv3 File handles are 32 bytes long", texts[windows_fh_32]),
+        ("Windows", "Only NFS versions 3 and 4.1 supported", texts[windows_versions]),
+        ("FreeBSD", "Mountd reports subnets without mask", texts[freebsd_subnet]),
+        ("NetApp", "netapp partner protocol supported", texts[netapp_service]),
+        ("HP-UX", "Only one request per TCP connection possible", texts[hpux_resetting])
+    ]
+    print_table(output)
+
+    final_guess = "Unknown"
+    if netapp_service:
+        final_guess = "NetApp"
+    elif hpux_resetting:
+        final_guess = "HP-UX"
+    elif windows_versions and windows_fh_32:
+        final_guess = "Windows"
+    elif freebsd_subnet:
+        final_guess = "FreeBSD"
+    elif linux_fh_0100:
+        final_guess = "Linux"
+    elif windows_versions or windows_fh_32:
+        final_guess = "Windows"
+    print()
+    print(f"Final OS guess: {final_guess}")
+
+    if final_guess != None:
+        json_out["os"]["final_guess"] = final_guess
+    
+    json_out["os"]["checks"] = {
+        "linux_fh_0100": linux_fh_0100,
+        "windows_fh_32": windows_fh_32,
+        "windows_versions": windows_versions,
+        "freebsd_subnet": freebsd_subnet,
+        "netapp_service": netapp_service,
+        "hpux_resetting": hpux_resetting,
+    }
+
 def parse_args():
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
 
@@ -1044,6 +1189,10 @@ def parse_args():
                         help="Do not ping clients reported by mount")
     parser.add_argument("--ping-timeout", type=int, default=1,
                         help="Number of seconds before a ping times out")
+    parser.add_argument("--v4-overview-depth", type=int, default=2,
+                        help="Depth of directory tree in NFSv4 overview")
+    parser.add_argument("--v4-show-exports-only", action="store_true",
+                        help="Only show export root directories in the NFSv4 overview. Only works on Linux servers, does not show nested exports")
     parser.add_argument("--charset", type=str, default="utf-8",
                         help="charset used by the server")
     parser.add_argument("--json-file", type=str,
@@ -1117,6 +1266,9 @@ def scan_host(hostname, json_out):
             json_out["portmap"]["reason"] = "strict_security"
 
             return json_out
+        
+        json_out["portmap"]["resetting"] = (type(portmap_client) == ResettingClient)
+
         pmap_print_summary(mappings, json_out)
         mountd_port = pmap_get_mountd_port(mappings)
         portmap_client.stop()
@@ -1161,8 +1313,6 @@ def scan_host(hostname, json_out):
         else:
             print(Coloring.error("No NFS server detected"))
 
-            return json_out
-
     print()
 
     if nfs_supported_versions["3"] and exports != None and mount_results != None:
@@ -1204,6 +1354,12 @@ def scan_host(hostname, json_out):
             else:
                 nfs4_show_overview(nfs4_client, json_out)
                 nfs_stop_client(nfs4_client)
+
+    print()
+
+    guess_os(json_out)
+
+    print()
 
     return json_out
 
