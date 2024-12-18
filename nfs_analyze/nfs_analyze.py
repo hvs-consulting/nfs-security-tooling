@@ -184,6 +184,34 @@ def pmap_get_mountd_port(mappings):
     
     return -1
 
+def pmap_supports(mappings, protocol):
+    for map in pmap_mappings_to_array(mappings):
+        if protocol.items() <= map.__dict__.items():
+            return True
+    return False
+
+def pmap_print_warnings(mappings):
+    mountd = {"prog": 100005}
+    nfs = {"prog": 100003}
+    v3 = {"vers": 3}
+    v4 = {"vers": 4}
+    tcp = {"prot": 6}
+    udp = {"prot": 17}
+
+    if not pmap_supports(mappings, nfs):
+        print(Coloring.error("Server does not support nfs"))
+    elif not pmap_supports(mappings, nfs | v3) and not pmap_supports(mappings, nfs | v4):
+        print(Coloring.error("Server only supports old NFS versions, this script only supports v3 and v4"))
+
+    if pmap_supports(mappings, nfs | v3 | udp) and not pmap_supports(mappings, nfs | v3 | tcp):
+        print(Coloring.error("Server only supports NFSv3 over UDP, this script only supports TCP"))
+
+    if not pmap_supports(mappings, mountd):
+        print(Coloring.error("Server does not support mountd"))
+    elif not pmap_supports(mappings, mountd | v3):
+        print(Coloring.error("Server only supports old mountd versions, this script only supports v3"))
+    elif not pmap_supports(mappings, mountd | v3 | tcp):
+        print(Coloring.error("Server only supports mountdv3 over UDP, this script only supports TCP"))
 
 Export = collections.namedtuple("Export", ["directory", "groups"])
 
@@ -1270,6 +1298,7 @@ def scan_host(hostname, json_out):
         json_out["portmap"]["resetting"] = (type(portmap_client) == ResettingClient)
 
         pmap_print_summary(mappings, json_out)
+        pmap_print_warnings(mappings)
         mountd_port = pmap_get_mountd_port(mappings)
         portmap_client.stop()
         if mountd_port != -1:

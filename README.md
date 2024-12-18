@@ -22,8 +22,7 @@ It is based on a [modified version of pynfs](https://github.com/hvs-consulting/p
 **WARNING**: *This script leaves traces in logs and the rmtab on the server.*
 
 ```
-usage: nfs_analyze [-h] [--check-no-root-squash] [--btrfs-subvolumes BTRFS_SUBVOLUMES] [--delay DELAY] [--timeout TIMEOUT] [--skip-version-check] [--no-color] [--no-ping] [--ping-timeout PING_TIMEOUT] [--charset CHARSET] [--json-file JSON_FILE] [--json-dir JSON_DIR] [--findings-file FINDINGS_FILE] [--verbose-errors] [--reload-pynfs]
-                   [target ...]
+usage: nfs_analyze [-h] [--check-no-root-squash] [--btrfs-subvolumes BTRFS_SUBVOLUMES] [--delay DELAY] [--timeout TIMEOUT] [--skip-version-check] [--no-color] [--no-ping] [--ping-timeout PING_TIMEOUT] [--v4-overview-depth V4_OVERVIEW_DEPTH] [--v4-show-exports-only] [--charset CHARSET] [--json-file JSON_FILE] [--json-dir JSON_DIR] [--findings-file FINDINGS_FILE] [--verbose-errors] [--reload-pynfs] [target ...]
 
 positional arguments:
   target                List of targets, each target can be an IP address, a hostname or a path to a file containing a host on each line (default: None)
@@ -41,6 +40,10 @@ options:
   --no-ping             Do not ping clients reported by mount (default: False)
   --ping-timeout PING_TIMEOUT
                         Number of seconds before a ping times out (default: 1)
+  --v4-overview-depth V4_OVERVIEW_DEPTH
+                        Depth of directory tree in NFSv4 overview (default: 2)
+  --v4-show-exports-only
+                        Only show export root directories in the NFSv4 overview. Only works on Linux servers, does not show nested exports (default: False)
   --charset CHARSET     charset used by the server (default: utf-8)
   --json-file JSON_FILE
                         Output to a single json file (default: None)
@@ -125,6 +128,9 @@ It creates a directory owned by root and checks if the creation is successful.
 
 ### Overview of files available via NFSv4
 This check is useful if the server doesn't support NFSv3 and the first check doesn't show any exports
+
+### Server OS guess
+This check tries to guess the server OS by analyzing file handles, protocol versions and other unique properties of different operating systems.
 
 ![nfs_analyze](img/nfs_analyze.png)
 
