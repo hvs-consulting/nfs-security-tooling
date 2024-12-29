@@ -1,4 +1,4 @@
-This repository contains two tools, `nfs_analyze` and `fuse_nfs` that are released along with our [blog post](https://www.hvs-consulting.de/TODO) on the NFS protocol from a pentester's perspective.
+This repository contains two tools, `nfs_analyze` and `fuse_nfs` that are released along with our [blog post](https://www.hvs-consulting.de/nfs-security-identifying-and-exploiting-misconfigurations/) on the NFS protocol from a pentester's perspective.
 
 These tools are designed for and tested on Linux. 
 To install, first make sure pkg-config, libfuse3-dev and python3-dev are installed.
@@ -16,7 +16,7 @@ Afterwards, you can install `nfs_analyze` and `fuse_nfs`, for example with [pipx
 pipx install git+https://github.com/hvs-consulting/nfs-security-tooling.git
 ~~~
 
-The programs require cap_net_bind_service or root privileges to use privileged ports. On Kali this should work automatically because it does not have privileged ports, on other systems you may have to install and run the program as root or temporarily disable privileged ports by running ```sudo sysctl net.ipv4.ip_unprivileged_port_start=0```.
+The programs require ```cap_net_bind_service``` or root privileges to use privileged ports. On Kali this should work automatically because it does not have privileged ports, on other systems you may have to install and run the program as root or temporarily disable privileged ports by running ```sudo sysctl net.ipv4.ip_unprivileged_port_start=0```.
 
 # nfs_analyze
 This script prints details about an NFS server and detects some potential misconfigurations which are highlighted in red.
