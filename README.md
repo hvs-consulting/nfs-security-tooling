@@ -1,4 +1,4 @@
-This repository contains two tools, `nfs_analyze` and `fuse_nfs` that are released along with our [blog post](https://www.hvs-consulting.de/nfs-security-identifying-and-exploiting-misconfigurations/) on the NFS protocol from a pentester's perspective.
+This repository contains two tools, `nfs_analyze` and `fuse_nfs` that are released along with our [blog post](https://www.hvs-consulting.de/en/nfs-security-identifying-and-exploiting-misconfigurations/) on the NFS protocol from a pentester's perspective.
 
 These tools are designed for and tested on Linux. 
 To install, first make sure pkg-config, libfuse3-dev and python3-dev are installed.
