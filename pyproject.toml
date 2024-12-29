@@ -6,8 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "nfs_security_tooling"
 version = "0.1"
 dependencies = [
-    'rpc @ git+ssh://git@github.com/hvs-consulting/pynfs.git#egg=rpc&subdirectory=rpc',
-    'nfs4 @ git+ssh://git@github.com/hvs-consulting/pynfs.git#egg=nfs4&subdirectory=nfs4.1',
+    'rpc @ https://github.com/hvs-consulting/pynfs.git#egg=rpc&subdirectory=rpc',
+    'nfs4 @ https://github.com/hvs-consulting/pynfs.git#egg=nfs4&subdirectory=nfs4.1',
     'pyfuse3==3.3.0',
     'anfs==0.0.2',
 ]
