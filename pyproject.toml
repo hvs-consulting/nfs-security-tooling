@@ -11,6 +11,7 @@ dependencies = [
     'pyfuse3',
     'anfs',
     'xdrlib3; python_version>="3.13"',
+    'standard-xdrlib'
 ]
 
 [project.scripts]
