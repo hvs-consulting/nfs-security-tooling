@@ -1,5 +1,10 @@
 This repository contains two tools, `nfs_analyze` and `fuse_nfs` that are released along with our [blog post](https://www.hvs-consulting.de/en/nfs-security-identifying-and-exploiting-misconfigurations/) on the NFS protocol from a pentester's perspective.
 
+The tools can detect common misconfigurations on NFS servers that allow access to files outside the exported directories and privilege escalation.
+
+The [wiki](https://github.com/hvs-consulting/nfs-security-tooling/wiki) contains technical background information.
+
+# Installation
 These tools are designed for and tested on Linux. 
 To install, first make sure pkg-config, libfuse3-dev and python3-dev are installed.
 For example, on Kali you can run 
@@ -25,7 +30,7 @@ It is based on a [modified version of pynfs](https://github.com/hvs-consulting/p
 **WARNING**: *This script leaves traces in logs and the rmtab on the server.*
 
 ```
-usage: nfs_analyze [-h] [--check-no-root-squash] [--btrfs-subvolumes BTRFS_SUBVOLUMES] [--delay DELAY] [--timeout TIMEOUT] [--skip-version-check] [--no-color] [--no-ping] [--ping-timeout PING_TIMEOUT] [--v4-overview-depth V4_OVERVIEW_DEPTH] [--v4-show-exports-only] [--charset CHARSET] [--json-file JSON_FILE] [--json-dir JSON_DIR] [--findings-file FINDINGS_FILE] [--verbose-errors] [--reload-pynfs] [target ...]
+usage: nfs_analyze [-h] [--check-no-root-squash] [--btrfs-subvolumes BTRFS_SUBVOLUMES] [--delay DELAY] [--timeout TIMEOUT] [--skip-version-check] [--no-color] [--no-ping] [--ping-timeout PING_TIMEOUT] [--v4-overview-depth V4_OVERVIEW_DEPTH] [--v4-show-exports-only] [--check-v4] [--charset CHARSET] [--json-file JSON_FILE] [--json-dir JSON_DIR] [--findings-file FINDINGS_FILE] [--verbose-errors] [--reload-pynfs] [target ...]
 
 positional arguments:
   target                List of targets, each target can be an IP address, a hostname or a path to a file containing a host on each line (default: None)
@@ -47,6 +52,7 @@ options:
                         Depth of directory tree in NFSv4 overview (default: 2)
   --v4-show-exports-only
                         Only show export root directories in the NFSv4 overview. Only works on Linux servers, does not show nested exports (default: False)
+  --check-v4            Run checks with v4 even if v3 is available (default: False)
   --charset CHARSET     charset used by the server (default: utf-8)
   --json-file JSON_FILE
                         Output to a single json file (default: None)
@@ -112,25 +118,34 @@ This only works if all of the following conditions are met:
 - The export does not have the option `subtree_check` set in `/etc/exports`
 - The export is stored on an `ext`, `xfs` or `btrfs` file system
 
-If this check reports a successful escape, check the directory listing to see if this escape would give an attacker access to files that are not accessible otherwise.
-If the directory listing contains the same entries that the export itself contains, the export is already the root of the file system and the escape has no effect.
-
 The file handle of the file system root directory will be displayed. This file handle can be used by fuse_nfs to interact with the file system.
 
 If the escape was sucessful, the check tries to read `/etc/shadow` using two methods:
 1. use uid and gid 0 -> works if `no_root_squash` is set
 2. if gid of `/etc/shadow` is not 0, use that gid -> works on SuSE and Debian based systems
+3. only on NFSv4 with idmapping: use the hardcoded gids 42 (Debian) and 15 (SuSE)
 
 The `/etc/shadow` can only be read if the export is on the same partition where the operating system is installed.
+
+On btrfs file systems there might be different versions of `/etc/shadow` in different snapshots.
 
 ### no_root_squash
 **WARNING:** *This creates a directory in each export and deletes it immediately afterwards. For this reason it has to be manually enabled using `--check-no-root-squash`*
 
 This check only works if the export allows `AUTH_SYS` and if it is writable.
 It creates a directory owned by root and checks if the creation is successful.
+If `no_root_squash` is enabled, file operations can be performed as root, which can lead to privilege escalation using setuid binaries and device files.
+Even if `no_root_squash` is disabled, it is still possible to perform privilege escalation on misconfigured clients in some cases.
+See [section 5.2 in the wiki](https://github.com/hvs-consulting/nfs-security-tooling/wiki/5_2_0-Privilege_Escalation) for more details about privilege escalation.
 
-### Overview of files available via NFSv4
-This check is useful if the server doesn't support NFSv3 and the first check doesn't show any exports
+### Overview of directories available via NFSv4
+This check is useful if the server doesn't support NFSv3. The overview depth can be configured using the `--v4-overview-depth` parameter.
+
+### Guessed NFSv4 exports
+In the NFSv4 protocol, the client cannot get a list of exports from the server. There is only one directory tree that contains all exports as subdirectories.
+This check analyses NFSv4 file handles from the directory overview check in order to guess which of the directories are export roots.
+This only works on Linux servers and the result can be inaccurate because the directory overveiw has a limited depth and the script cannot tell if a file system mounted in an export is an independent export or not.
+If the script was unable to get a list of exports using the mount protocol or if the option `--check-v4` was specified, it can run the other checks using this guessed export list over NFSv4.
 
 ### Server OS guess
 This check tries to guess the server OS by analyzing file handles, protocol versions and other unique properties of different operating systems.
@@ -138,7 +153,7 @@ This check tries to guess the server OS by analyzing file handles, protocol vers
 ![nfs_analyze](img/nfs_analyze.png)
 
 # fuse_nfs
-This is a fuse driver that can mount an NFS export. The advantage of this script compared to the normal mount command is that it autamatically sends the right uid and gid to the server to get access to as many files as possible. It is also able to mount an arbitrary file handle including file system root file handles found by nfs_analyze.
+This is a fuse driver that can mount an NFSv3 export. The advantage of this script compared to the normal mount command is that it autamatically sends the right uid and gid to the server to get access to as many files as possible. It is also able to mount an arbitrary file handle including file system root file handles found by nfs_analyze.
 This tool is based on [anfs](https://github.com/skelsec/anfs).
 
 ## Required setup

@@ -6,7 +6,7 @@ import logging
 import subprocess
 import time
 import pathlib
-from typing import List
+from typing import List, Union
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 import os
 import importlib
@@ -14,6 +14,7 @@ import json
 import copy
 import datetime
 import traceback
+import uuid
 
 import rpc.security
 
@@ -40,6 +41,7 @@ default_json_out = {
     },
     "exports": {
         "status": JSONStatus.UNKNOWN,
+        "directories": {},
     },
     "invalid_exports": {},
     "versions": {
@@ -72,6 +74,13 @@ default_findings = {
 auth_sys = rpc.security.AuthSys()
 
 options = None
+
+MountEntry = collections.namedtuple("MountEntry", ["fh", "auth_sys"])
+
+direntry_fields = ["name", "filehandle", "type", "owner", "group", "mode", "fileid"]
+DirEntry = collections.namedtuple("DirEntry", direntry_fields , defaults=(None,) * len(direntry_fields))
+
+NFSClient = Union[nfs3client.NFS3Client, nfs4client.NFS4Client, nfs4client.SessionRecord]
 
 class TerminalColors:
     OK = "\033[92m"
@@ -245,7 +254,7 @@ def mount_get_all_info(mount_client: nfs3client.Mnt3Client, exports: xdrdef.mnt3
     try:
         mount_client.proc(xdrdef.mnt3_const.MOUNTPROC3_UMNTALL, 0, "void")
     except Exception as e:
-        print(f"Error unmounting exports, IP might remain in rmtab on the server: {e}")
+        print(f"Error unmounting exports, IP might remain in rmtab on the server: {type(e)}, {e}")
 
     return result
 
@@ -256,6 +265,17 @@ def mount_get_all_clients(mount_client: nfs3client.Mnt3Client):
     except Exception as e:
         print(f"Error getting list of clients: {e}")
         return []
+    
+def mount_to_mount_results(mount_raw):
+    mount_results = dict()
+    for dir, details in mount_raw.items():
+        fh = None
+        if details.fhs_status == xdrdef.mnt3_const.MNT3_OK and details.fhandle != None and details.fhandle != b"":
+            fh = details.fhandle
+        auth_sys = 1 in details.auth_flavors
+        mount_results[dir] = MountEntry(fh=fh, auth_sys=auth_sys)
+    
+    return mount_results
 
 def get_auth_method(number):
     auth_method_numbers = {
@@ -436,9 +456,17 @@ fsid_lens = {
     7: 24,
 }
 
-def nfs3_check_escape(nfs3_client: nfs3client.NFS3Client, root_fh: bytearray, export: bytearray, json_entry: dict, btrfs_subvolume_id = None):
-    result = nfs3_readdir_plus(nfs3_client, root_fh)
-    if result != []:
+def nfs_check_escape(nfs_client: NFSClient, root_fh: bytearray, export_fh: bytearray, export: bytearray, json_entry: dict, btrfs_subvolume_id = None):
+    read_etc_shadow = nfs3_read_etc_shadow
+    check_root_permissions = nfs3_check_root_permissions
+    compare_dirs = False
+    if type(nfs_client) == nfs4client.NFS4Client or type(nfs_client) == nfs4client.SessionRecord:
+        read_etc_shadow = nfs4_read_etc_shadow
+        check_root_permissions = nfs4_check_root_permissions
+        compare_dirs = True
+
+    result = nfs_readdir(nfs_client, root_fh)[0]
+    if result != [] and (not compare_dirs or nfs4_compare_dirs(nfs_client, result, root_fh, export_fh)):
         dir_list = [entry.name.decode(options.charset) for entry in result]
         if btrfs_subvolume_id == None:
             print(Coloring.error("Escape successful, root directory listing:"))
@@ -459,25 +487,25 @@ def nfs3_check_escape(nfs3_client: nfs3client.NFS3Client, root_fh: bytearray, ex
             json_entry["root_fh"] += f"\n{btrfs_subvolume_id}: {binascii.hexlify(root_fh).decode()}"
             json_entry["root_dir"] += f"\n{btrfs_subvolume_id}: {dir_list}"
 
-        nfs3_read_etc_shadow(nfs3_client, root_fh, json_entry["etc_shadow"])
-        nfs3_check_root_permissions(nfs3_client, root_fh, export, json_entry["symlink_escape"])
+        read_etc_shadow(nfs_client, root_fh, json_entry["etc_shadow"])
+        check_root_permissions(nfs_client, root_fh, export, json_entry["symlink_escape"])
         return True
     else:
         if json_entry["status"] != JSONStatus.VULNERABLE:
             json_entry["status"] = JSONStatus.OK
     return False
 
-def nfs3_try_escape(nfs3_client: nfs3client.NFS3Client, mount_results, json_out):
+def nfs_try_escape(nfs_client: NFSClient, mount_results, json_out):
     print("Trying to escape exports")
     for directory in mount_results:
         mount_result = mount_results[directory]
         json_entry = json_out["exports"]["directories"][directory.decode(options.charset)]["escape"]
-        if mount_result.fhs_status != xdrdef.mnt3_const.MNT3_OK or mount_result.fhandle == None or mount_result.fhandle == b"":
+        if mount_result.fh == None:
             json_entry["status"] = JSONStatus.ERROR
             json_entry["reason"] = "mount_failed"
             continue
 
-        export_fh = bytearray(mount_result.fhandle)
+        export_fh = bytearray(mount_result.fh)
         
         if len(export_fh) < 5 or export_fh[0] != 1:
             print(Coloring.ok("Escape failed") + ", unknown file handle type, server probably not Linux")
@@ -487,7 +515,7 @@ def nfs3_try_escape(nfs3_client: nfs3client.NFS3Client, mount_results, json_out)
             return b""
 
         filesystem = FileID.unknown
-        export_dir: List[xdrdef.nfs3_type.entryplus3] = nfs3_readdir_plus(nfs3_client, export_fh)
+        export_dir: List[DirEntry] = nfs_readdir(nfs_client, export_fh)[0]
         parent_handle = None
         parent_fileid = None
         export_fileid = None
@@ -496,13 +524,13 @@ def nfs3_try_escape(nfs3_client: nfs3client.NFS3Client, mount_results, json_out)
                 export_fileid = entry.fileid
             if entry.name == b"..":
                 parent_fileid = entry.fileid
-                if entry.name_handle.handle_follows:
-                    parent_handle = entry.name_handle.handle.data
-            elif filesystem == FileID.unknown and entry.name != b"." and entry.name_handle.handle_follows:
-                if entry.name_handle.handle == None or entry.name_handle.handle.data == None or len(entry.name_handle.handle.data) < 5:
+                if entry.filehandle == None:
+                    parent_handle = entry.filehandle
+            elif filesystem == FileID.unknown and entry.name != b"." and entry.filehandle != None:
+                if entry.filehandle == None or len(entry.filehandle) < 5:
                     pass
                 else:
-                    fh_fileid = entry.name_handle.handle.data[3]
+                    fh_fileid = entry.filehandle[3]
                     if fh_fileid in fileid_types:
                        filesystem = fileid_types[fh_fileid]
         
@@ -521,7 +549,7 @@ def nfs3_try_escape(nfs3_client: nfs3client.NFS3Client, mount_results, json_out)
             continue
 
         fsid_len = fsid_lens[fsid_type]
-        root_fh = export_fh
+        root_fh = export_fh.copy()
 
         if filesystem == FileID.ext or filesystem == FileID.unknown:
             if export_fileid in [2, 128]:
@@ -536,13 +564,13 @@ def nfs3_try_escape(nfs3_client: nfs3client.NFS3Client, mount_results, json_out)
             root_fh[3] = 2
             root_fh[4 + fsid_len :] = [0x2, 0x0, 0x0, 0x0,    0x0, 0x0, 0x0, 0x0,    0x2, 0x0, 0x0, 0x0,    0x0, 0x0, 0x0, 0x0]
             logging.info(f"trying filehandle {root_fh}")
-            if nfs3_check_escape(nfs3_client, root_fh, directory, json_entry):
+            if nfs_check_escape(nfs_client, root_fh, export_fh, directory, json_entry):
                 continue
 
             root_fh[3] = 2
             root_fh[4 + fsid_len :] = [128, 0x0, 0x0, 0x0,    0x0, 0x0, 0x0, 0x0,    128, 0x0, 0x0, 0x0,    0x0, 0x0, 0x0, 0x0]
             logging.info(f"trying filehandle {root_fh}")
-            if nfs3_check_escape(nfs3_client, root_fh, directory, json_entry):
+            if nfs_check_escape(nfs_client, root_fh, export_fh, directory, json_entry):
                 continue
 
         if filesystem == FileID.btrfs or filesystem == FileID.unknown:
@@ -551,7 +579,7 @@ def nfs3_try_escape(nfs3_client: nfs3client.NFS3Client, mount_results, json_out)
                 root_fh[3] = 0x4d
                 root_fh[4 + fsid_len :] = [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, i, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
                 logging.info(f"trying filehandle {root_fh}")
-                if nfs3_check_escape(nfs3_client, root_fh, directory, json_entry, i + 256):
+                if nfs_check_escape(nfs_client, root_fh, export_fh, directory, json_entry, i + 256):
                     escape_success = True
                     continue
             
@@ -562,11 +590,11 @@ def nfs3_try_escape(nfs3_client: nfs3client.NFS3Client, mount_results, json_out)
         print()
 
 def nfs3_read_etc_shadow(nfs3_client: nfs3client.NFS3Client, root_fh: bytearray, json_entry: dict):
-    etc = nfs3_lookup(nfs3_client, root_fh, b"etc")
+    etc = nfs_lookup(nfs3_client, root_fh, b"etc")
     if etc != None:
         test_files = ["shadow"]
         for file_name in test_files:
-            shadow = nfs3_lookup(nfs3_client, etc, file_name.encode(options.charset))
+            shadow = nfs_lookup(nfs3_client, etc, file_name.encode(options.charset))
             if shadow == None:
                 json_entry["status"] = JSONStatus.OK
                 json_entry["reason"] = "file_not_found"
@@ -615,6 +643,64 @@ def nfs3_read_etc_shadow(nfs3_client: nfs3client.NFS3Client, root_fh: bytearray,
                 json_entry["reason"] = f"wrong_permissions"
                 json_entry["content"] = content
 
+def nfs4_read_etc_shadow(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, root_fh: bytearray, json_entry: dict):
+    shadow_gids = [42, 15]
+    etc = nfs_lookup(nfs4_client, root_fh, b"etc")
+    if etc == None:
+        return
+    
+    shadow = nfs_lookup(nfs4_client, etc, b"shadow")
+    if shadow == None:
+        return
+    
+    cred = auth_sys.init_cred(0, 0, b"test", 44, [1001, 1002]) 
+    shadow_res = nfs4_read_entire_file(nfs4_client, shadow, cred)
+    if shadow_res.status == xdrdef.nfs4_const.NFS4_OK:
+        content = shadow_res.resok4.data.decode(options.charset)
+        print(Coloring.error("no_root_squash ENABLED, FULL ROOT ACCESS TO SYSTEM"))
+        print(Coloring.error("Content of /etc/shadow:"))
+        print(Coloring.error(content))
+        json_entry["status"] = JSONStatus.VULNERABLE
+        json_entry["reason"] = "no_root_squash"
+        json_entry["content"] = content
+        return
+
+    attr_response = nfs4_getattr(nfs4_client, shadow, (1 << xdrdef.nfs4_const.FATTR4_OWNER) | (1 << xdrdef.nfs4_const.FATTR4_OWNER_GROUP))
+    if attr_response.status == xdrdef.nfs4_const.NFS4_OK:
+        attrs = attr_response.resarray[1].opgetattr.resok4.obj_attributes
+        group = attrs[xdrdef.nfs4_const.FATTR4_OWNER_GROUP].decode(options.charset)
+
+        if group.isascii() and group.isnumeric():
+            gid = int(group)
+            shadow_gids = [gid] + shadow_gids
+        else:
+            print(f"Server uses idmapping: /etc/shadow belongs to: {group}")
+
+        
+    for gid in shadow_gids:
+        cred = auth_sys.init_cred(1000, gid, b"test", 45, [1001, 1002])
+        shadow_res = nfs4_read_entire_file(nfs4_client, shadow, cred)
+        if shadow_res.status == xdrdef.nfs4_const.NFS4_OK:
+            content = shadow_res.resok4.data.decode(options.charset)
+            print(Coloring.error(f"GID of shadow group: {gid}"))
+            print(Coloring.error("Content of /etc/shadow:"))
+            print(Coloring.error(content))
+            json_entry["status"] = JSONStatus.VULNERABLE
+            json_entry["reason"] = f"shadow_group {gid}"
+            json_entry["content"] = content
+            break
+    
+    cred = auth_sys.init_cred(1000, 1000, b"test", 46, [1001, 1002]) 
+    shadow_res = nfs4_read_entire_file(nfs4_client, shadow, cred)
+    if shadow_res.status == xdrdef.nfs4_const.NFS4_OK:
+        content = shadow_res.resok4.data.decode(options.charset)
+        print(Coloring.error("File /etc/shadow readable by unprivileged user"))
+        print(Coloring.error("Content of /etc/shadow:"))
+        print(Coloring.error(content))
+        json_entry["status"] = JSONStatus.VULNERABLE
+        json_entry["reason"] = "wrong_permissions"
+        json_entry["content"] = content
+
 def nfs3_check_no_root_squash(nfs3_client: nfs3client.NFS3Client, mount_results, json_out):
     print("Checking no_root_squash")
     data = [("Export", "no_root_squash")]
@@ -624,16 +710,16 @@ def nfs3_check_no_root_squash(nfs3_client: nfs3client.NFS3Client, mount_results,
     nfs3_client.set_cred(root_credential)
     for directory in mount_results:
         mount_result = mount_results[directory]
-        if mount_result.fhs_status == xdrdef.mnt3_const.MNT3_OK and mount_result.fhandle != None and mount_result.fhandle != b"":
+        if mount_result.fh != None:
             status_text = ""
             json_entry = json_out["exports"]["directories"][directory.decode(options.charset)]["no_root_squash"]
             json_entry["status"] = JSONStatus.UNKNOWN
-            if 1 not in mount_result.auth_flavors:
+            if not mount_result.auth_sys:
                 status_text = Coloring.ok("AUTH_SYS not supported") + " (no_root_squash status unknown)"
                 json_entry["status"] = JSONStatus.UNKNOWN
                 json_entry["reason"] = "auth_sys_not_supported"
             else:
-                export_fh = mount_result.fhandle
+                export_fh = mount_result.fh
                 try:
                     mkdir_result = nfs3_mkdir(nfs3_client, export_fh, test_file, 0, 0, 0o600)
                 except rpc.rpc.RPCDeniedError as e:
@@ -683,15 +769,95 @@ def nfs3_check_no_root_squash(nfs3_client: nfs3client.NFS3Client, mount_results,
     print_table(data)
     nfs3_client.set_cred(old_credential)
 
+def nfs4_check_no_root_squash(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, exports, json_out):
+    print("Checking no_root_squash (NFSv4)")
+    data = [("Export", "no_root_squash")]
+    test_dir_name = b"nfs_analyze_test"
+    cred_root = auth_sys.init_cred(0, 0, b"test", 47, [1001])
+    for directory, export in exports.items():
+        if export.fh == None:
+            continue
+        
+        fh = export.fh
+
+        status_text = ""
+        json_entry = json_out["exports"]["directories"][directory.decode(options.charset)]["no_root_squash"]
+        json_entry["status"] = JSONStatus.UNKNOWN
+
+        if not export.auth_sys:
+            status_text = Coloring.ok("AUTH_SYS not supported") + " (no_root_squash status unknown)"
+            json_entry["status"] = JSONStatus.UNKNOWN
+            json_entry["reason"] = "auth_sys_not_supported"
+        
+        try:
+            #attrs = {xdrdef.nfs4_const.FATTR4_OWNER: b"0", xdrdef.nfs4_const.FATTR_OWNER_GROUP: b"0"}
+            attrs = dict()
+            mkdir_result = nfs4_create(nfs4_client, fh, test_dir_name, xdrdef.nfs4_type.createtype4(type=xdrdef.nfs4_const.NF4DIR), attrs, cred_root)
+        except rpc.rpc.RPCDeniedError:
+            json_entry["status"] = JSONStatus.OK
+            json_entry["reason"] = "disabled"
+            status_text = Coloring.ok("DISABLED")
+        else:
+            if mkdir_result.status == xdrdef.nfs4_const.NFS4_OK:
+                created_fh = nfs4_lookup(nfs4_client, fh, test_dir_name)
+                if created_fh == None:
+                    json_entry["status"] = JSONStatus.OK
+                    json_entry["reason"] = "lookup_failed"
+                    status_text = Coloring.ok("DISABLED") + " lookup failed"
+                else:
+                    attr_response = nfs4_getattr(nfs4_client, created_fh, (1 << xdrdef.nfs4_const.FATTR4_OWNER) | (1 << xdrdef.nfs4_const.FATTR4_OWNER_GROUP))
+                    if attr_response.status == xdrdef.nfs4_const.NFS4_OK:
+                        attrs = attr_response.resarray[1].opgetattr.resok4.obj_attributes
+                        owner = attrs[xdrdef.nfs4_const.FATTR4_OWNER].decode(options.charset)
+                        group = attrs[xdrdef.nfs4_const.FATTR4_OWNER_GROUP].decode(options.charset)
+
+                        if (owner.isnumeric() and owner.isascii() and int(owner) == 0) or "root" in owner:
+                            json_entry["status"] = JSONStatus.VULNERABLE
+                            json_entry["reason"] = "enabled"
+                            status_text = Coloring.error("ENABLED (privilege escalation on client possible)")
+                        else:
+                            json_entry["status"] = JSONStatus.OK
+                            json_entry["reason"] = "disabled"
+                            status_text = Coloring.ok("DISABLED")
+                        
+                        rmdir_result = nfs4_remove(nfs4_client, fh, test_dir_name, cred_root)
+                        if rmdir_result.status != xdrdef.nfs3_const.NFS3_OK:
+                            json_entry["status"] = JSONStatus.ERROR
+                            json_entry["reason"] = "could_not_delete_test_directory"
+                            status_text += Coloring.error(f" Could not delete test directory. Please delete {directory.decode()}/{test_dir_name.decode()} manually")
+
+
+            elif mkdir_result.status == xdrdef.nfs4_const.NFS4ERR_ROFS:
+                json_entry["status"] = JSONStatus.UNKNOWN
+                json_entry["reason"] = "readonly"
+                status_text = Coloring.ok("READONLY") + " (no_root_squash status unknown)"
+            elif mkdir_result.status == xdrdef.nfs4_const.NFS4ERR_ACCESS:
+                json_entry["status"] = JSONStatus.OK
+                json_entry["reason"] = "disabled"
+                status_text = Coloring.ok("DISABLED")
+            elif mkdir_result.status == xdrdef.nfs4_const.NFS4ERR_EXIST:
+                status_text = Coloring.error("Test directory exists from previous test exists")
+                json_entry["status"] = JSONStatus.ERROR
+                json_entry["reason"] = "test_directory_exists"
+                #rmdir_result = nfs3_rmdir(nfs3_client, export_fh, test_file)
+                rmdir_result = nfs4_remove(nfs4_client, fh, test_dir_name, cred_root)
+                if rmdir_result.status != xdrdef.nfs4_const.NFS4_OK:
+                    status_text += Coloring.error(f" Could not delete test directory. Please delete {directory.decode()}/{test_dir_name.decode()} manually")
+                    json_entry["status"] = JSONStatus.ERROR
+                    json_entry["reason"] = "could_not_delete_test_directory"
+                else:
+                    status_text += " Successfully deleted test directory"
+
+            data.append((directory.decode(options.charset), status_text))
+        
+    print_table(data)
+
+
 def nfs3_check_root_permissions(nfs3_client: nfs3client.NFS3Client, root_fh: bytearray, export: bytearray, json_entry: dict):
     path = list(pathlib.Path(export.decode(options.charset)).parts)
-    #print(path)
-    #print(nfs3_lookup_raw(nfs3_client, root_fh, b"."))
-    #path[0] = "."
     current_fh = root_fh
     for directory in path[1:]:
         lookup_res = nfs3_lookup_raw(nfs3_client, current_fh, directory.encode(options.charset))
-        #print(lookup_res)
         if lookup_res.status != xdrdef.nfs3_const.NFS3_OK:
             continue
         current_fh = lookup_res.resok.object.data
@@ -702,7 +868,6 @@ def nfs3_check_root_permissions(nfs3_client: nfs3client.NFS3Client, root_fh: byt
         uid = dir_attrs.uid
         gid = dir_attrs.gid
         mode = dir_attrs.mode
-        #print(f"{directory}: {uid}, {gid}: {oct(mode)}")
 
         if uid != 0 or gid != 0 or mode & 0b000000010 != 0:
             print(Coloring.error(f"Full escape might be possible: Path component {directory} has a writable parent directory and can be replaced with a symlink"))
@@ -717,7 +882,83 @@ def nfs3_check_root_permissions(nfs3_client: nfs3client.NFS3Client, root_fh: byt
     json_entry["status"] = JSONStatus.OK
     json_entry["reason"] = "correct_permissions"
 
+def nfs4_check_root_permissions(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, root_fh: bytearray, export: bytearray, json_entry:dict):
+    path = list(pathlib.Path(export.decode(options.charset)).parts)
+    current_fh = root_fh
+    for directory in path[1:-1]:
+        lookup_res = nfs4_lookup(nfs4_client, current_fh, directory.encode(options.charset))
 
+        if lookup_res == None:
+            break
+
+        current_fh = lookup_res
+
+        attr_response = nfs4_getattr(nfs4_client, current_fh, (1 << xdrdef.nfs4_const.FATTR4_OWNER) | (1 << xdrdef.nfs4_const.FATTR4_OWNER_GROUP) | (1 << xdrdef.nfs4_const.FATTR4_MODE))
+        if attr_response.status == xdrdef.nfs4_const.NFS4_OK:
+            attrs = attr_response.resarray[1].opgetattr.resok4.obj_attributes
+            owner = attrs[xdrdef.nfs4_const.FATTR4_OWNER].decode(options.charset)
+            group = attrs[xdrdef.nfs4_const.FATTR4_OWNER_GROUP].decode(options.charset)
+            mode = attrs[xdrdef.nfs4_const.FATTR4_MODE]
+
+            if owner.isnumeric() and owner.isascii() and group.isnumeric() and group.isascii():
+                if int(owner) != 0 or int(group) != 0 or mode & 0b000000010 != 0:
+                    print(Coloring.error(f"Full escape might be possible: Path component {directory} is a writable directory and can be replaced with a symlink"))
+                    print()
+
+                    json_entry["status"] = JSONStatus.VULNERABLE
+                    json_entry["reason"] = "writable_parent_directory"
+                    json_entry["directory"] = directory
+            else:
+                if not "root" in owner or not "root" in group or mode & 0b000000010 != 0:
+                    print(Coloring.error(f"Full escape might be possible: Path component {directory}, owned by user {owner}, group {group} is a writable directory and can be replaced with a symlink"))
+                    print()
+
+                    json_entry["status"] = JSONStatus.VULNERABLE
+                    json_entry["reason"] = "writable_parent_directory"
+                    json_entry["directory"] = directory
+
+    json_entry["status"] = JSONStatus.OK
+    json_entry["reason"] = "correct_permissions"
+
+def nfs4_compare_dirs(nfs_client: NFSClient, escape_dir: List[DirEntry], root_fh: bytearray, export_fh: bytearray):
+    export_dir = nfs_readdir(nfs_client, export_fh)[0]
+
+    if abs(len(escape_dir) - len(export_dir)) > 3:
+        return True
+    
+    for entry in escape_dir:
+        if b"." in entry.name:
+            continue
+
+        for compare in export_dir:
+            if compare.name == entry.name:
+                break
+        else:
+            return True
+    
+    return False
+    
+
+def fh_get_fsid(fh: bytearray):
+    if(len(fh) < 4 or fh[0] != 1 or fh[1] != 0 or not fh[2] in fsid_lens):
+        return bytearray()
+    
+    fsid_len = fsid_lens[fh[2]]
+
+    if fsid_len + 4 > len(fh):
+        return bytearray()
+    
+    return fh[4 : 4 + fsid_len]
+
+#http://git.linux-nfs.org/?p=steved/nfs-utils.git;a=blob;f=support/export/v4root.c;h=c3b17a55e483816b3f1ea594e5c0c6b494cb9bdd;hb=HEAD#l101
+LINUX_NAMESPACE = uuid.UUID("39c6b5c1-3f24-4f4e-977c-7fe6546b8a25")
+
+def nfs4_is_pseudo_root(fh: bytearray, path: bytes):
+    if len(fh) < 28 or fh[0:4] != bytearray([0x01, 0x00, 0x07, 0x00]):
+        return False
+
+    pseudo_uuid = uuid.uuid5(LINUX_NAMESPACE, path)
+    return pseudo_uuid.bytes[2:] == fh[14:28]
 
 def nfs4_secinfo_to_string(secinfo: xdrdef.nfs4_type.secinfo4):
     if secinfo.flavor == 6:
@@ -747,8 +988,13 @@ def nfs4_secinfo_to_json(secinfo: xdrdef.nfs4_type.secinfo4):
         return "sys"
     return f"unknown (secinfo.flavor)"
 
+def nfs4_secinfo_allows_sys(secinfos: List[xdrdef.nfs4_type.secinfo4]):
+    for secinfo in secinfos:
+        if secinfo.flavor == 1:
+            return True
+    return False
 
-def nfs4_dir_secinfo(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, json_entry, file_handle, depth, limit = 10, maxdepth=2):
+def nfs4_dir_secinfo(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, json_entry, exports, file_handle, path, parent_fsid, depth, limit = 10, maxdepth=2):
     dir_result = nfs4_list_dir(nfs4_client, file_handle)
     if len(dir_result.resarray) < 2 or dir_result.resarray[1].opreaddir == None or dir_result.resarray[1].opreaddir.status != xdrdef.nfs4_const.NFS4_OK:
         print(f"{' ' * depth * 4}Error reading directory" + f" {dir_result.resarray[1].opreaddir.status}" if options.verbose_errors else "")
@@ -756,28 +1002,38 @@ def nfs4_dir_secinfo(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionReco
         entries = dir_result.resarray[1].opreaddir.resok4.entries
         for entry in entries:
             if entry.attrs[xdrdef.nfs4_const.FATTR4_TYPE] == xdrdef.nfs4_const.NF4DIR:
-                if options.v4_show_exports_only and xdrdef.nfs4_const.FATTR4_FILEHANDLE in entry.attrs:
-                    fh = entry.attrs[xdrdef.nfs4_const.FATTR4_FILEHANDLE]
-                    if len(fh) > 4 and fh[0:2] == b"\x01\x00" and fh[3] != 0:
-                        continue
                 entry_name = entry.name.decode(options.charset)
+                fh = entry.attrs[xdrdef.nfs4_const.FATTR4_FILEHANDLE]
+                is_pseudo_root = nfs4_is_pseudo_root(fh, path + entry.name)
+                fsid = fh_get_fsid(fh)
+                is_export_root = fsid != parent_fsid and not is_pseudo_root
+
+                if is_export_root:
+                    exports[path + entry.name] = {"fh": fh}
+
                 print(f"{' ' * depth * 4}{entry_name}: ", end="")
                 json_entry |= {entry_name : {"security": None, "children": {}}}
                 secinfo_result = nfs4_secinfo(nfs4_client, file_handle, entry.name)
                 if len(secinfo_result.resarray) < 2 or secinfo_result.resarray[1].opsecinfo == None or secinfo_result.resarray[1].opsecinfo.status != xdrdef.nfs4_const.NFS4_OK:
                     print("Error getting security information")
                 else:
-                    print(", ".join([nfs4_secinfo_to_string(secinfo) for secinfo in secinfo_result.resarray[1].opsecinfo.resok4]))
+                    if (path + entry.name) in exports:
+                        exports[path + entry.name]["auth"] = secinfo_result.resarray[1].opsecinfo.resok4
+                    if not is_pseudo_root:
+                        print(", ".join([nfs4_secinfo_to_string(secinfo) for secinfo in secinfo_result.resarray[1].opsecinfo.resok4]))
+                    else:
+                        print("pseudo")
                     json_entry[entry_name]["security"] = [nfs4_secinfo_to_json(secinfo) for secinfo in secinfo_result.resarray[1].opsecinfo.resok4]
-                    if depth < maxdepth:
-                        nfs4_dir_secinfo(nfs4_client, json_entry[entry_name]["children"], entry.attrs[xdrdef.nfs4_const.FATTR4_FILEHANDLE], depth+1, limit, maxdepth)
+                    if depth < maxdepth and (is_pseudo_root or not options.v4_show_exports_only):
+                        nfs4_dir_secinfo(nfs4_client, json_entry[entry_name]["children"], exports, fh, path + entry.name + b"/", fsid, depth+1, limit, maxdepth)
             pass
 
-def nfs4_show_overview(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, json_out):
+def nfs4_show_overview(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, add_exports_to_json: bool, json_out):
     print("NFSv4 overview and auth methods (incomplete)")
+    nfs4_exports = dict()
     try:
         root_fh = nfs4_get_root_fh(nfs4_client)
-        nfs4_dir_secinfo(nfs4_client, json_out["nfs4_overview"]["directories"], root_fh.resarray[1].opgetfh.resok4.object, 0, 10, options.v4_overview_depth)
+        nfs4_dir_secinfo(nfs4_client, json_out["nfs4_overview"]["directories"], nfs4_exports, root_fh.resarray[1].opgetfh.resok4.object, b"/", bytearray(), 0, 10, options.v4_overview_depth)
         json_out["nfs4_overview"]["status"] = JSONStatus.OK
     except Exception as e:
         print(f"Error listing directories: {e}")
@@ -786,12 +1042,55 @@ def nfs4_show_overview(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRe
         json_out["nfs4_overview"]["status"] = JSONStatus.ERROR
         json_out["nfs4_overview"]["reason"] = str(e)
 
+    print()
+    print("NFSv4 guessed exports (Linux only, may differ from /etc/exports):")
+    export_table = [("Directory", "Auth methods", "Export file handle")]
+    result = dict()
+    for directory, export in nfs4_exports.items():
+        file_handle_text = binascii.hexlify(export["fh"]).decode()
+        export_table += [(directory.decode(options.charset), ", ".join([nfs4_secinfo_to_string(secinfo) for secinfo in export["auth"]]), file_handle_text)]
+        result[directory] = MountEntry(fh=export["fh"], auth_sys=nfs4_secinfo_allows_sys(export["auth"]))
+        if add_exports_to_json:
+            json_out["exports"]["status"] = JSONStatus.OK
+            json_out["exports"]["directories"][directory.decode(options.charset)] = {
+                "allowed_clients": [],
+                "mount_result": "MNT3_OK",
+                "auth_methods": [nfs4_secinfo_to_json(secinfo) for secinfo in export["auth"]],
+                "file_handle": file_handle_text,
+                "clients": [],
+                "escape": {
+                    "status": JSONStatus.UNKNOWN,
+                    "reason": "",
+                    "fstype": FileID.unknown,
+                    "parent_inode": None,
+                    "root_fh": None,
+                    "root_dir": None,
+                    "etc_shadow": {
+                        "status": JSONStatus.UNKNOWN,
+                        "reason": "",
+                        "content": None,
+                    },
+                    "symlink_escape": {
+                        "status": JSONStatus.UNKNOWN,
+                        "reason": "",
+                        "directory": None,
+                    }
+                },
+                "no_root_squash": {
+                    "status": JSONStatus.SKIPPED,
+                    "reason": "",
+                }
+            }
+    
+    print_table(export_table)
+
+    return result
 
 def nfs3_check_windows_signing(mount_results, json_out):
     print("NFSv3 Windows File Handle Signing: ", end="")
     for export in mount_results.values():
-        if export.fhs_status == xdrdef.mnt3_const.MNT3_OK and export.fhandle != None:
-            export_fh = export.fhandle
+        if export.fh != None:
+            export_fh = export.fh
             if len(export_fh) != 32:
                 json_out["windows_handle_signing"]["status"] = JSONStatus.OK
                 json_out["windows_handle_signing"]["reason"] = "not_windows"
@@ -813,9 +1112,34 @@ def nfs3_check_windows_signing(mount_results, json_out):
     json_out["windows_handle_signing"]["reason"] = "no_suitable_export"
     print("Testing not possible, no export available")
 
-def nfs41_check_windows_signing(nfs41_session: nfs4client.SessionRecord):
+def nfs41_check_windows_signing(nfs41_session: nfs4client.SessionRecord, json_out):
     print("NFSv4.1 Windows File Handle Signing: ", end="")
-    root_fh = nfs4_get_root_fh(nfs41_session)
+    root_fh_res = nfs4_get_root_fh(nfs41_session)
+    if root_fh_res.status != xdrdef.nfs4_const.NFS4_OK:
+        json_out["windows_handle_signing"]["status"] = JSONStatus.UNKNOWN
+        json_out["windows_handle_signing"]["reason"] = "no_suitable_export"
+        print("Testing not possible, no export available")
+        return
+
+    root_fh = root_fh_res.resarray[1].opgetfh.resok4.object
+
+    if len(root_fh) != 28 or root_fh[4:12] != "\xFF"*8:
+        json_out["windows_handle_signing"]["status"] = JSONStatus.OK
+        json_out["windows_handle_signing"]["reason"] = "not_windows"
+        print(Coloring.ok("OK") + ", server probably not Windows, Root file handle not as expected")
+        return
+    
+    if root_fh[-16:] == b"\x00"*16:
+        json_out["windows_handle_signing"]["status"] = JSONStatus.VULNERABLE
+        json_out["windows_handle_signing"]["reason"] = "disabled"
+        print(Coloring.error("DISABLED (arbitrary access possible)"))
+    else:
+        print(Coloring.ok("Enabled"))
+        json_out["windows_handle_signing"]["status"] = JSONStatus.OK
+        json_out["windows_handle_signing"]["reason"] = "enabled"
+
+
+
 
 def nfs3_lookup_raw(nfs3_client: nfs3client.NFS3Client, fh: bytearray, name: bytes):
     fh = xdrdef.nfs3_type.nfs_fh3(data=fh)
@@ -834,12 +1158,51 @@ def nfs3_lookup(nfs3_client: nfs3client.NFS3Client, fh: bytearray, name: bytes):
     else:
         return result.resok.object.data
 
-def nfs3_lookup_parent(nfs3_client: nfs3client.NFS3Client, export_fh: bytearray):
-    fh = xdrdef.nfs3_type.nfs_fh3(data=export_fh)
-    diropargs = xdrdef.nfs3_type.diropargs3(dir = fh, name=b"..")
-    lookupargs = xdrdef.nfs3_type.LOOKUP3args(what=diropargs)
+def nfs4_lookup(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, fh: bytearray, name: bytes):
+    putfhargs = xdrdef.nfs4_type.PUTFH4args(object = fh)
+    putfh = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_PUTFH, opputfh=putfhargs)
+    lookupargs = xdrdef.nfs4_type.LOOKUP4args(objname = name)
+    lookup = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_LOOKUP, oplookup=lookupargs)
+    getfh = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_GETFH)
 
-    print(nfs3_client.proc(xdrdef.nfs3_const.NFSPROC3_LOOKUP, lookupargs))
+    result = nfs4_client.compound(ops=[putfh, lookup, getfh])
+
+    if len(result.resarray) < 3:
+        return None
+    getfh_result = result.resarray[2].opgetfh
+    if getfh_result == None:
+        return None
+    if getfh_result.status != xdrdef.nfs4_const.NFS4_OK:
+        return None
+
+    return getfh_result.resok4.object
+
+def nfs_lookup(nfs_client: NFSClient, fh: bytearray, name: bytes):
+    if type(nfs_client) == nfs3client.NFS3Client:
+        return nfs3_lookup(nfs_client, fh, name)
+    else:
+        return nfs4_lookup(nfs_client, fh, name)
+
+def nfs4_getattr(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, fh: bytearray, attr_request: int):
+    putfhargs = xdrdef.nfs4_type.PUTFH4args(object = fh)
+    putfh = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_PUTFH, opputfh=putfhargs)
+    getattrargs = xdrdef.nfs4_type.GETATTR4args(attr_request = attr_request)
+    getattr = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_GETATTR, opgetattr=getattrargs)
+    return nfs4_client.compound(ops=[putfh, getattr])
+
+def nfs4_create(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, fh: bytearray, name: bytearray, obj_type: xdrdef.nfs4_type.createtype4, attrs: dict, cred):
+    putfhargs = xdrdef.nfs4_type.PUTFH4args(object = fh)
+    putfh = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_PUTFH, opputfh=putfhargs)
+    createargs = xdrdef.nfs4_type.CREATE4args(objtype=obj_type, objname=name, createattrs=attrs)
+    create = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_CREATE, opcreate=createargs)
+    return nfs4_client.compound(ops=[putfh, create], credinfo=cred)
+
+def nfs4_remove(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, fh: bytearray, name: bytearray, cred):
+    putfhargs = xdrdef.nfs4_type.PUTFH4args(object = fh)
+    putfh = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_PUTFH, opputfh=putfhargs)
+    removeargs = xdrdef.nfs4_type.REMOVE4args(target=name)
+    remove = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_REMOVE, opremove=removeargs)
+    return nfs4_client.compound(ops=[putfh, remove], credinfo=cred)
 
 def nfs3_readdir_plus(nfs3_client: nfs3client.NFS3Client, dir_fh: bytearray):
     fh = xdrdef.nfs3_type.nfs_fh3(data=dir_fh)
@@ -852,12 +1215,24 @@ def nfs3_readdir_plus(nfs3_client: nfs3client.NFS3Client, dir_fh: bytearray):
 
         result = nfs3_client.proc(xdrdef.nfs3_const.NFSPROC3_READDIRPLUS, readdirplusargs)
         if result == None or result.status != xdrdef.nfs3_const.NFS3_OK:
-            return entries
+            return entries, result.status
         else:
             current = result.resok.reply.entries
             while current != []:
                 current = current[0]
-                entries.append(current)
+
+                entry_fh = None
+                if(current.name_handle.handle_follows):
+                    entry_fh = current.name_handle.handle.data
+
+                entry = DirEntry(name = current.name, filehandle = entry_fh, fileid = current.fileid)
+
+                attrs = None
+                if(current.name_attributes.attributes_follow):
+                    attrs = current.name_attributes.attributes
+                    entry = DirEntry(name = current.name, filehandle = entry_fh, fileid = current.fileid, type = attrs.type, owner = attrs.uid, group = attrs.gid, mode = attrs.mode)
+
+                entries.append(entry)
                 cookie = current.cookie
                 current = current.nextentry
             if not result.resok.reply.eof:
@@ -865,8 +1240,14 @@ def nfs3_readdir_plus(nfs3_client: nfs3client.NFS3Client, dir_fh: bytearray):
             else:
                 done = True
     
-    return entries
-            
+    return entries, xdrdef.nfs3_const.NFS3_OK
+ 
+def nfs_readdir(nfs_client: NFSClient, dir_fh: bytearray):
+    if type(nfs_client) == nfs3client.NFS3Client:
+        return nfs3_readdir_plus(nfs_client, dir_fh)
+    else:
+        return nfs4_readdir(nfs_client, dir_fh)
+
 def nfs3_read_file(nfs3_client: nfs3client.NFS3Client, file_fh: bytearray, offset = 0, count = 4096) -> xdrdef.nfs3_type.READ3res:
     fh = xdrdef.nfs3_type.nfs_fh3(data=file_fh)
     readargs = xdrdef.nfs3_type.READ3args(file = fh, offset = offset, count = count)
@@ -892,12 +1273,37 @@ def nfs3_read_entire_file(nfs3_client: nfs3client.NFS3Client, file_fh: bytearray
 
     return result
 
-def nfs3_create_link(nfs3_client: nfs3client.NFS3Client, target_fh: bytearray, dir_fh: bytearray, name: bytearray):
-    target_fh = xdrdef.nfs3_type.nfs_fh3(data=target_fh)
-    dir_fh = xdrdef.nfs3_type.nfs_fh3(data=dir_fh)
-    diropargs = xdrdef.nfs3_type.diropargs3(dir=dir_fh, name=name)
-    linkargs = xdrdef.nfs3_type.LINK3args(file=target_fh, link=diropargs)
-    print(nfs3_client.proc(xdrdef.nfs3_const.NFSPROC3_LINK, linkargs))
+def nfs4_read(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, fh: bytearray, stateid: xdrdef.nfs4_type.stateid4, offset = 0, count = 4096, cred = None):
+    putfhargs = xdrdef.nfs4_type.PUTFH4args(object = fh)
+    putfh = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_PUTFH, opputfh=putfhargs)
+    readargs = xdrdef.nfs4_type.READ4args(stateid = stateid, offset = offset, count = count)
+    read = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_READ, opread=readargs)
+    if cred != None:
+        return nfs4_client.compound(ops=[putfh,read], credinfo = cred)
+    else:
+        return nfs4_client.compound(ops=[putfh,read])
+
+def nfs4_read_entire_file(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, fh: bytearray, cred = None):
+    done = False
+    data = b""
+    offset = 0
+
+    stateid = xdrdef.nfs4_type.stateid4(seqid = 0xFFFFFFFF, other = b"\xFF" * 12)
+
+    while not done:
+        result = nfs4_read(nfs4_client, fh, stateid, offset, 4096, cred)
+        read_res = result.resarray[1].opread
+        if read_res.status == xdrdef.nfs4_const.NFS4_OK:
+            data += read_res.resok4.data
+            offset += len(read_res.data)
+            done = read_res.resok4.eof
+        else:
+            return read_res
+    
+    result_ok = xdrdef.nfs4_type.READ4resok(True, data)
+    result = xdrdef.nfs4_type.READ4res(xdrdef.nfs4_const.NFS4_OK, result_ok)
+
+    return result
 
 def nfs3_mkdir(nfs3_client: nfs3client.NFS3Client, parent_fh: bytearray, name: bytearray, uid, gid, mode):
     parent_fh = xdrdef.nfs3_type.nfs_fh3(data=parent_fh)
@@ -912,23 +1318,10 @@ def nfs3_rmdir(nfs3_client: nfs3client.NFS3Client, parent_fh: bytearray, name: b
     rmdirargs = xdrdef.nfs3_type.RMDIR3args(diropargs)
     return nfs3_client.proc(xdrdef.nfs3_const.NFSPROC3_RMDIR, rmdirargs)
 
-#def nfs3_getattr(nfs3_client: nfs3client.NFS3Client, parent_fh: bytearray, name: bytearray):
-#    parent_fh = xdrdef.nfs3_type.nfs_fh3(data=parent_fh)
-#    diropargs = xdrdef.nfs3_type.diropargs3(dir=parent_fh, name=name)
-#    lookupargs = xdrdef.nfs3_type.LOOKUP3args(diropargs)
-#    return nfs3_client.proc(xdrdef.nfs3_const.NFSPROC3_GETATTR, lookupargs)
-
-
 def nfs4_get_root_fh(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord):
     putrootfh = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_PUTROOTFH)
     getfh = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_GETFH)
     return nfs4_client.compound(ops=[putrootfh, getfh])
-
-def nfs4_list_root_dir(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord):
-    putrootfh = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_PUTROOTFH)
-    readdirargs = xdrdef.nfs4_type.READDIR4args(cookie = 0, cookieverf = b"", dircount = 1000, maxcount = 10000, attr_request=(1 << xdrdef.nfs4_const.FATTR4_FILEHANDLE) | (1 << xdrdef.nfs4_const.FATTR4_OWNER))
-    readdir = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_READDIR, opreaddir=readdirargs)
-    return nfs4_client.compound(ops=[putrootfh, readdir])
 
 def nfs4_list_dir(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, file_handle: bytearray):
     putfhargs = xdrdef.nfs4_type.PUTFH4args(object = file_handle)
@@ -936,6 +1329,39 @@ def nfs4_list_dir(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord,
     readdirargs = xdrdef.nfs4_type.READDIR4args(cookie = 0, cookieverf = b"", dircount = 1000, maxcount = 10000, attr_request=(1 << xdrdef.nfs4_const.FATTR4_FILEHANDLE) | (1 << xdrdef.nfs4_const.FATTR4_OWNER) | (1 << xdrdef.nfs4_const.FATTR4_TYPE) | (1 << xdrdef.nfs4_const.FATTR4_MODE))
     readdir = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_READDIR, opreaddir=readdirargs)
     return nfs4_client.compound(ops=[putrootfh, readdir])
+
+def nfs4_readdir(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, dir_fh: bytearray):
+    cookie = 0
+    cookieverf = b""
+    done = False
+    entries = []
+    while not done:
+        #readdirplusargs = xdrdef.nfs3_type.READDIRPLUS3args(dir=fh, cookie=cookie, cookieverf=cookieverf, maxcount=100000, dircount=1000)
+        putfhargs = xdrdef.nfs4_type.PUTFH4args(object = dir_fh)
+        putfh = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_PUTFH, opputfh=putfhargs)
+        readdirargs = xdrdef.nfs4_type.READDIR4args(cookie, cookieverf, dircount = 1000, maxcount = 100000, attr_request=(1 << xdrdef.nfs4_const.FATTR4_FILEHANDLE) | (1 << xdrdef.nfs4_const.FATTR4_OWNER) | (1 << xdrdef.nfs4_const.FATTR4_OWNER_GROUP) | (1 << xdrdef.nfs4_const.FATTR4_TYPE) | (1 << xdrdef.nfs4_const.FATTR4_MODE) | (1 << xdrdef.nfs4_const.FATTR4_FILEID ) )
+        readdir = xdrdef.nfs4_type.nfs_argop4(argop=xdrdef.nfs4_const.OP_READDIR, opreaddir=readdirargs)
+        result = nfs4_client.compound(ops=[putfh, readdir])
+
+        if len(result.resarray) < 2:
+            return entries, -1
+        if result.resarray[1].opreaddir == None:
+            return entries, -2
+        if result.resarray[1].opreaddir.status != xdrdef.nfs4_const.NFS4_OK:
+            return entries, result.resarray[1].opreaddir.status
+        else:
+            dir_result = result.resarray[1].opreaddir
+            for current in dir_result.resok4.reply.entries:
+                entry = DirEntry(name = current.name, filehandle = current.attrs[xdrdef.nfs4_const.FATTR4_FILEHANDLE], type = current.attrs[xdrdef.nfs4_const.FATTR4_TYPE], owner = current.attrs[xdrdef.nfs4_const.FATTR4_OWNER], group = current.attrs[xdrdef.nfs4_const.FATTR4_OWNER_GROUP], mode = current.attrs[xdrdef.nfs4_const.FATTR4_MODE], fileid = current.attrs[xdrdef.nfs4_const.FATTR4_FILEID])
+                entries.append(entry)
+                cookie = current.cookie
+                current = current.nextentry
+            if not dir_result.resok4.reply.eof:
+                cookieverf = dir_result.resok4.cookieverf
+            else:
+                done = True
+    
+    return entries, xdrdef.nfs3_const.NFS3_OK
 
 def nfs4_secinfo(nfs4_client: nfs4client.NFS4Client | nfs4client.SessionRecord, file_handle: bytearray, file_name: bytearray):
     putfhargs = xdrdef.nfs4_type.PUTFH4args(object = file_handle)
@@ -1221,6 +1647,8 @@ def parse_args():
                         help="Depth of directory tree in NFSv4 overview")
     parser.add_argument("--v4-show-exports-only", action="store_true",
                         help="Only show export root directories in the NFSv4 overview. Only works on Linux servers, does not show nested exports")
+    parser.add_argument("--check-v4", action="store_true",
+                        help="Run checks with v4 even if v3 is available")
     parser.add_argument("--charset", type=str, default="utf-8",
                         help="charset used by the server")
     parser.add_argument("--json-file", type=str,
@@ -1307,8 +1735,9 @@ def scan_host(hostname, json_out):
                 print()
                 try:
                     exports = mountd_client.proc(xdrdef.mnt3_const.MOUNTPROC3_EXPORT, 0, "exports")
-                    mount_results = mount_get_all_info(mountd_client, exports)
-                    mount_print_details(exports, mount_results, json_out)
+                    mount_raw = mount_get_all_info(mountd_client, exports)
+                    mount_print_details(exports, mount_raw, json_out)
+                    mount_results = mount_to_mount_results(mount_raw)
                     print()
                     mount_print_clients(mount_get_all_clients(mountd_client), json_out)
                     mountd_client.stop()
@@ -1344,7 +1773,7 @@ def scan_host(hostname, json_out):
 
     print()
 
-    if nfs_supported_versions["3"] and exports != None and mount_results != None:
+    if nfs_supported_versions["3"] and exports != None and mount_results != None and not options.check_v4:
         nfs3_check_windows_signing(mount_results, json_out)
         print()
 
@@ -1355,7 +1784,7 @@ def scan_host(hostname, json_out):
             auth_sys = rpc.security.AuthSys()
             credential = auth_sys.init_cred(1000, 1000, b"test", 42, [1001, 1002])
             nfs3_client.set_cred(credential)
-            nfs3_try_escape(nfs3_client, mount_results, json_out)
+            nfs_try_escape(nfs3_client, mount_results, json_out)
 
             if options.check_no_root_squash:
                 nfs3_check_no_root_squash(nfs3_client, mount_results, json_out)
@@ -1381,7 +1810,21 @@ def scan_host(hostname, json_out):
             if nfs4_client == None:
                 print(Coloring.error("Error creating NFSv4.1/4.2 session"))
             else:
-                nfs4_show_overview(nfs4_client, json_out)
+                run_v4_checks = not nfs_supported_versions["3"] or exports == None or mount_results == None or options.check_v4
+                nfs4_exports = nfs4_show_overview(nfs4_client, run_v4_checks, json_out)
+                print()
+
+                if run_v4_checks:
+                    nfs41_check_windows_signing(nfs4_client, json_out)
+                    print()
+
+                    nfs_try_escape(nfs4_client, nfs4_exports, json_out)
+
+                    if options.check_no_root_squash:
+                        nfs4_check_no_root_squash(nfs4_client, nfs4_exports, json_out)
+                    
+
+
                 nfs_stop_client(nfs4_client)
 
     print()

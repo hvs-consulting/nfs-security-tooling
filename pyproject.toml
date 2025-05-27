@@ -9,7 +9,7 @@ dependencies = [
     'rpc @ git+https://github.com/hvs-consulting/pynfs.git#egg=rpc&subdirectory=rpc',
     'nfs4 @ git+https://github.com/hvs-consulting/pynfs.git#egg=nfs4&subdirectory=nfs4.1',
     'pyfuse3',
-    'anfs',
+    'anfs @ git+https://github.com/skelsec/anfs.git',
     'xdrlib3; python_version>="3.13"',
     'standard-xdrlib'
 ]
