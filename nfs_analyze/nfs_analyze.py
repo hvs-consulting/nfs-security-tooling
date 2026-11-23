@@ -270,9 +270,11 @@ def mount_to_mount_results(mount_raw):
     mount_results = dict()
     for dir, details in mount_raw.items():
         fh = None
-        if details.fhs_status == xdrdef.mnt3_const.MNT3_OK and details.fhandle != None and details.fhandle != b"":
-            fh = details.fhandle
-        auth_sys = 1 in details.auth_flavors
+        auth_sys = False
+        if details.fhs_status == xdrdef.mnt3_const.MNT3_OK:
+            if details.fhandle:
+                fh = details.fhandle
+            auth_sys = 1 in details.auth_flavors
         mount_results[dir] = MountEntry(fh=fh, auth_sys=auth_sys)
     
     return mount_results
