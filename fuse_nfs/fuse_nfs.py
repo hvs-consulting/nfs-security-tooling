@@ -523,7 +523,8 @@ def main():
     except RuntimeError as e:
         log.error(f"Error setting up fuse mount: {str(e)}")
         log.error(f"Make sure that {options.mountpoint} exists and has been unmounted")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(pyfuse3.main())
     except:
